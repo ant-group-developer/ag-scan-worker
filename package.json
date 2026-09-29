@@ -1,0 +1,39 @@
+{
+  "name": "@ag-farm/ag-scan-worker",
+  "version": "0.1.0",
+  "description": "Worker quét footage (scan.extract, scan.ai) cho máy cấu hình cao",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "bundle": "node bundle.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "jest",
+    "start": "node dist/main.js"
+  },
+  "resolutions": {
+    "@ag-farm/protocol": "link:../ag-farm/packages/protocol",
+    "@ag-farm/worker-sdk": "link:../ag-farm/packages/worker-sdk"
+  },
+  "dependencies": {
+    "@ag-farm/protocol": "link:../ag-farm/packages/protocol",
+    "@ag-farm/worker-sdk": "link:../ag-farm/packages/worker-sdk",
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0",
+    "sharp": "^0.33.5",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.0",
+    "typescript": "^5.6.0"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "rootDir": "src",
+    "testTimeout": 30000
+  }
+}
