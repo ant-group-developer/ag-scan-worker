@@ -1,0 +1,8 @@
+# Slot của cả máy, dùng chung cho mọi worker trên máy (ag-scan-worker, ag-render-worker).
+# Đặt tại C:\ProgramData\ag-farm\machine.yaml (Windows) hoặc /etc/ag-farm/machine.yaml (Linux).
+cpu_slots: 4
+gpu_slots: 1
+# Giữ lại cho việc của Studio (lane interactive) để việc quét không chiếm hết
+reserve_interactive:
+  cpu: 1
+  gpu: 0

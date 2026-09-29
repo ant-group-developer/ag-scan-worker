@@ -1,0 +1,27 @@
+# Cấu hình ag-scan-worker. Sao chép thành config.yaml (cạnh package.json) rồi sửa.
+# Đường dẫn Windows viết trong nháy đơn để khỏi phải escape dấu \.
+
+# URL của ag-farm hub (API, không phải web quản lý)
+hub_url: https://farm-api.example.com
+# Token node: tạo trên web quản lý ag-farm (trang Máy), chỉ hiện một lần
+token: 'DAN_TOKEN_NODE_VAO_DAY'
+# Tên hiển thị trên trang Máy
+name: gpu-01-scan
+# Máy không có GPU: chỉ để scan.extract
+kinds:
+  - scan.extract
+  - scan.ai
+work_dir: 'D:\ag-farm\scan\work'
+# Cache file gốc tải về (không watermark): thư mục chỉ tài khoản chạy dịch vụ đọc được
+cache:
+  dir: 'D:\ag-farm\scan\cache'
+  max_gb: 200
+# Mặc định C:\ProgramData\ag-farm\machine.yaml (dùng chung với ag-render-worker trên cùng máy)
+# machine_file: 'C:\ProgramData\ag-farm\machine.yaml'
+
+# Lịch chạy (bỏ trống = 24/7)
+# schedule:
+#   - { days: [1, 2, 3, 4, 5], from: '19:00', to: '07:00' }
+
+# scan.ai gọi Ollama ở http://localhost:11434; model do ag-go-api gửi trong job (ANALYSIS_MODEL,
+# mặc định qwen2.5vl:7b) nên máy phải `ollama pull` đúng model đó.

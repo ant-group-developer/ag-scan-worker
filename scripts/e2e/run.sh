@@ -75,7 +75,8 @@ JOB=$(curl -s -X POST localhost:3978/v1/owner/jobs -H "Authorization: Owner $OWN
 JOB_ID=$(node -e "console.log(JSON.parse(process.argv[1]).job.id)" "$JOB") || { echo "submit failed: $JOB"; exit 1; }
 echo "submitted $JOB_ID"
 
-cd "$WORKER" && node dist/main.js --config "$SP/worker.yaml" > "$SP/worker.log" 2>&1 & pids+=($!)
+# WORKER_RUN_DIR/WORKER_ENTRY: chạy bản phát hành (scripts/release.mjs) thay cho dist/ của repo
+cd "${WORKER_RUN_DIR:-$WORKER}" && node "${WORKER_ENTRY:-dist/main.js}" --config "$SP/worker.yaml" > "$SP/worker.log" 2>&1 & pids+=($!)
 
 STATUS=queued
 for i in $(seq 1 90); do
