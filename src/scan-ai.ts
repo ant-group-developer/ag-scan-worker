@@ -67,9 +67,11 @@ async function imageToBase64(localPath: string): Promise<{ data: string; mimeTyp
 
 // ---- Ollama API call ----
 
+/** Ollama /api/chat message: `content` is text only; pictures go in `images` as bare base64 (no data: URL). */
 interface OllamaMessage {
   role: string;
-  content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
+  content: string;
+  images?: string[];
 }
 
 interface OllamaResponse {
@@ -89,7 +91,8 @@ async function callOllama(
     messages,
     stream: false,
     format: jsonSchema,
-    options: { temperature: 0 },
+    // A small model can loop on a list (the same tag over and over): cap the answer instead of waiting minutes.
+    options: { temperature: 0, num_predict: 1024 },
     keep_alive: keepAlive,
   };
 
@@ -202,28 +205,23 @@ export async function handleScanAi(ctx: JobContext): Promise<JobResult> {
       continue;
     }
 
-    // Xây dựng messages với ảnh
-    const imageContents: Array<{ type: string; image_url: { url: string } }> = [];
+    // Keyframe đi trong `images` của tin nhắn user (định dạng của Ollama, không phải image_url kiểu OpenAI)
+    const images: string[] = [];
     for (const localPath of localKeyframePaths) {
       try {
-        const { data, mimeType } = await imageToBase64(localPath);
-        imageContents.push({ type: 'image_url', image_url: { url: `data:${mimeType};base64,${data}` } });
+        images.push((await imageToBase64(localPath)).data);
       } catch (e) {
         log.warn(`Failed to encode keyframe`, { error: String(e) });
       }
     }
 
-    const userContent: OllamaMessage['content'] = [
-      ...imageContents,
-      {
-        type: 'text',
-        text: `Mô tả đoạn video này (index=${seg.index}, ${seg.start_ms}ms–${seg.end_ms}ms). Trả lời theo JSON schema.`,
-      },
-    ];
-
     const messages: OllamaMessage[] = [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userContent },
+      {
+        role: 'user',
+        content: `Mô tả đoạn video này (index=${seg.index}, ${seg.start_ms}ms–${seg.end_ms}ms). Trả lời theo JSON schema.`,
+        images,
+      },
     ];
 
     // Gọi Ollama với retry sửa lỗi

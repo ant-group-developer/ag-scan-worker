@@ -39,10 +39,13 @@ function createFakeOllama(options: FakeOllamaOptions): Promise<{
   server: Server;
   url: string;
   callCount: number;
+  /** base64 keyframes of the last accepted request */
+  lastImages: string[];
   close(): Promise<void>;
 }> {
   return new Promise((resolve) => {
     let callIdx = 0;
+    let lastImages: string[] = [];
 
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       if (req.url !== '/api/chat') {
@@ -54,6 +57,23 @@ function createFakeOllama(options: FakeOllamaOptions): Promise<{
       const chunks: Buffer[] = [];
       req.on('data', (chunk: Buffer) => chunks.push(chunk));
       req.on('end', () => {
+        // Like the real Ollama: every message's content is a string, pictures are base64 strings in
+        // `images` (an array content, OpenAI style, is answered with HTTP 400).
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          messages?: Array<{ content?: unknown; images?: unknown }>;
+        };
+        const bad = (body.messages ?? []).find(
+          (m) =>
+            typeof m.content !== 'string' ||
+            (m.images !== undefined &&
+              !(Array.isArray(m.images) && m.images.every((i) => typeof i === 'string' && !i.startsWith('data:')))),
+        );
+        if (bad || !body.messages?.length) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'json: cannot unmarshal array into Go struct field .ChatRequest.messages.content of type string' }));
+          return;
+        }
+        lastImages = body.messages.flatMap((m) => (Array.isArray(m.images) ? (m.images as string[]) : []));
         const responseText = options.responses[callIdx] ?? null;
         callIdx++;
 
@@ -75,6 +95,7 @@ function createFakeOllama(options: FakeOllamaOptions): Promise<{
         server,
         url: `http://127.0.0.1:${addr.port}`,
         get callCount() { return callIdx; },
+        get lastImages() { return lastImages; },
         close: () => new Promise((r) => server.close(() => r())),
       });
     });
@@ -208,6 +229,9 @@ describe('handleScanAi', () => {
     await ollama.close();
 
     expect(result.manifest).toBe('ai-0000.json');
+    // the keyframe went to Ollama as a bare base64 image, the way /api/chat takes it
+    expect(ollama.lastImages).toHaveLength(1);
+    expect(Buffer.from(ollama.lastImages[0]!, 'base64').subarray(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
 
     const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
     const manifestBuf = uploads.get('ai-0000.json');
