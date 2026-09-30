@@ -157,6 +157,10 @@ export async function probeMedia(filePath: string, ffprobe: string): Promise<Med
 /**
  * Dò cắt cảnh bằng ffmpeg select=gt(scene,T),showinfo.
  * Trả về các thời điểm cắt (ms) theo timeline file (đã trừ start_time).
+ *
+ * Lỗi:
+ * - Nếu ffmpeg không chạy được: ném lỗi retryable.
+ * - Nếu ffmpeg thoát code ≠ 0 hoặc timeout: log cảnh báo, trả về cắt đã đọc được (partial).
  */
 export async function detectSceneChanges(
   filePath: string,
@@ -169,14 +173,24 @@ export async function detectSceneChanges(
   const args = ['-i', filePath, '-vf', vf, '-f', 'null', '-'];
 
   let stderr = '';
-  const result = await runProcess(ffmpeg, args, {
-    timeoutMs: 120_000,
-    onStderrLine: (line) => { stderr += line + '\n'; },
-  });
+  let result: Awaited<ReturnType<typeof runProcess>>;
 
-  if (result.exitCode !== 0 && result.signal !== 'SIGKILL') {
-    // ffmpeg exit code non-zero is normal when outputting to null
-    // only warn if we have no output at all
+  try {
+    result = await runProcess(ffmpeg, args, {
+      timeoutMs: 120_000,
+      onStderrLine: (line) => { stderr += line + '\n'; },
+    });
+  } catch (err) {
+    // ffmpeg could not be launched at all (binary missing, permission error, etc.)
+    throw new Error(`Scene detection failed: ffmpeg could not run: ${String(err)}`);
+  }
+
+  if (result.exitCode !== 0 || result.signal !== null) {
+    // Non-zero exit or killed: log warning and fall back to partial cuts.
+    const reason = result.signal ? `signal=${result.signal}` : `exit=${result.exitCode ?? '?'}`;
+    log.warn(`detectSceneChanges: ffmpeg finished with ${reason}; using partial scene cuts`, {
+      file: filePath,
+    });
   }
 
   const times = new Set<number>();
@@ -257,19 +271,40 @@ function buildProxyArgs(
 
 // ---- Trích keyframe ----
 
+/**
+ * Trích một JPEG keyframe tại `timeSec` và scale về cạnh dài = `keyframe_px`.
+ *
+ * Nếu `sourceWidth` và `sourceHeight` được cung cấp, định hướng được xác định trực tiếp:
+ *   - dọc (portrait: height > width) → scale=-2:keyframe_px (cạnh dài là chiều cao)
+ *   - ngang / vuông → scale=keyframe_px:-2 (cạnh dài là chiều rộng)
+ * Khi không có thông tin, fallback về scale=keyframe_px:-2 (hành vi cũ).
+ */
 export async function extractKeyframe(
   proxyPath: string,
   outputPath: string,
   timeSec: number,
-  width: number,
+  keyframe_px: number,
+  sourceWidth?: number,
+  sourceHeight?: number,
 ): Promise<void> {
   const ffmpeg = resolveFfmpeg();
+
+  // Determine scale filter: long edge = keyframe_px
+  let scaleFilter: string;
+  if (sourceWidth !== undefined && sourceHeight !== undefined && sourceHeight > sourceWidth) {
+    // Portrait: height is the long edge
+    scaleFilter = `scale=-2:${keyframe_px}`;
+  } else {
+    // Landscape / square: width is the long edge (also backward-compatible default)
+    scaleFilter = `scale=${keyframe_px}:-2`;
+  }
+
   const args = [
     '-y',
     '-ss', String(timeSec),
     '-i', proxyPath,
     '-vframes', '1',
-    '-vf', `scale=${width}:-2`,
+    '-vf', scaleFilter,
     '-q:v', '2',
     outputPath,
   ];
@@ -290,7 +325,7 @@ export interface TechMetrics {
 }
 
 /**
- * Chạy ffmpeg filters để lấy các chỉ số kỹ thuật cho một đoạn.
+ * Chạy ffmpeg filters để lấy các chỉ số kỹ thuật cho một đoạn (hoặc cả video khi startSec=0).
  * Sử dụng signalstats, blurdetect, blackdetect, freezedetect, silencedetect.
  */
 export async function getTechMetrics(

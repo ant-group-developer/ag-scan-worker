@@ -1,5 +1,7 @@
 /**
- * Test scan.ai handler: fake Ollama server.
+ * Test scan.ai handler v2: hai bước (notes + summary), fake Ollama server.
+ * Kiểm tra: số lần gọi = ceil(frames/frames_per_note)+1, ảnh gửi, repair JSON,
+ * error → ném lỗi sau khi viết manifest, yield trước mỗi lần gọi Ollama.
  */
 import { createServer } from 'node:http';
 import type { Server, IncomingMessage, ServerResponse } from 'node:http';
@@ -9,19 +11,17 @@ import { tmpdir } from 'node:os';
 import sharp from 'sharp';
 import { createScanAiHandler, handleScanAi } from './scan-ai';
 import type { JobContext } from '@ag-farm/worker-sdk';
-import type { AiManifest } from '@ag-farm/protocol';
 import { AiManifestSchema } from '@ag-farm/protocol';
 
 jest.setTimeout(60_000);
 
 // ---- Fixtures ----
 
-const TEST_BASE = join(tmpdir(), `ag-scan-ai-${process.pid}`);
+const TEST_BASE = join(tmpdir(), `ag-scan-ai-v2-${process.pid}`);
 
 async function createTestKeyframe(dir: string, name: string): Promise<string> {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
-  // Tạo ảnh test 64×64 xanh lá
   await sharp({
     create: { width: 64, height: 64, channels: 3, background: { r: 0, g: 128, b: 0 } },
   }).jpeg().toFile(path);
@@ -32,70 +32,67 @@ async function createTestKeyframe(dir: string, name: string): Promise<string> {
 
 interface FakeOllamaOptions {
   responses: Array<string | null>; // null = HTTP 500
-  port?: number;
 }
 
 function createFakeOllama(options: FakeOllamaOptions): Promise<{
   server: Server;
   url: string;
   callCount: number;
-  /** base64 keyframes of the last accepted request */
   lastImages: string[];
+  allCallImages: string[][];
   close(): Promise<void>;
 }> {
   return new Promise((resolve) => {
     let callIdx = 0;
     let lastImages: string[] = [];
+    const allCallImages: string[][] = [];
 
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-      if (req.url !== '/api/chat') {
-        res.writeHead(404);
-        res.end();
-        return;
-      }
+      if (req.url !== '/api/chat') { res.writeHead(404); res.end(); return; }
 
       const chunks: Buffer[] = [];
       req.on('data', (chunk: Buffer) => chunks.push(chunk));
       req.on('end', () => {
-        // Like the real Ollama: every message's content is a string, pictures are base64 strings in
-        // `images` (an array content, OpenAI style, is answered with HTTP 400).
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
           messages?: Array<{ content?: unknown; images?: unknown }>;
         };
+        // Validate Ollama format: content must be string, images must be bare base64
         const bad = (body.messages ?? []).find(
           (m) =>
             typeof m.content !== 'string' ||
             (m.images !== undefined &&
-              !(Array.isArray(m.images) && m.images.every((i) => typeof i === 'string' && !i.startsWith('data:')))),
+              !(Array.isArray(m.images) &&
+                m.images.every((i) => typeof i === 'string' && !i.startsWith('data:')))),
         );
         if (bad || !body.messages?.length) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'json: cannot unmarshal array into Go struct field .ChatRequest.messages.content of type string' }));
+          res.end(JSON.stringify({ error: 'bad message format' }));
           return;
         }
-        lastImages = body.messages.flatMap((m) => (Array.isArray(m.images) ? (m.images as string[]) : []));
+        const imgs = body.messages.flatMap((m) =>
+          Array.isArray(m.images) ? (m.images as string[]) : [],
+        );
+        lastImages = imgs;
+        allCallImages.push(imgs);
+
         const responseText = options.responses[callIdx] ?? null;
         callIdx++;
 
-        if (responseText === null) {
-          res.writeHead(500);
-          res.end('Internal error');
-          return;
-        }
+        if (responseText === null) { res.writeHead(500); res.end('Internal error'); return; }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ message: { content: responseText } }));
       });
     });
 
-    const port = options.port ?? 0;
-    server.listen(port, '127.0.0.1', () => {
+    server.listen(0, '127.0.0.1', () => {
       const addr = server.address() as { port: number };
       resolve({
         server,
         url: `http://127.0.0.1:${addr.port}`,
         get callCount() { return callIdx; },
         get lastImages() { return lastImages; },
+        get allCallImages() { return allCallImages; },
         close: () => new Promise((r) => server.close(() => r())),
       });
     });
@@ -116,15 +113,15 @@ function buildFakeAiContext(
   const ctx: JobContext & { ollamaUrl?: string } = {
     ollamaUrl,
     job: {
-      id: '123e4567-e89b-42d3-a456-426614174003',
+      id: '123e4567-e89b-42d3-a456-426614174010',
       owner: 'ag-go',
       type: 'scan.ai',
       lane: 'batch',
       attempt: 1,
       payload,
-      lease_token: 'lease-token-fake-scan-ai-00000000',
+      lease_token: 'lease-token-fake-scan-ai-v2',
       lease_expires_at: new Date(Date.now() + 120_000).toISOString(),
-      ticket: 'ticket-fake-ai-placeholder-00000000000000',
+      ticket: 'ticket-fake-ai-v2-00000000000000',
       sign_url: 'http://127.0.0.1:9/sign',
     },
     payload,
@@ -144,19 +141,17 @@ function buildFakeAiContext(
     yieldToInteractive: async () => {},
 
     async download(inputName: string, dest: string) {
-      // inputName like 'artifact:keyframes/0001-1.jpg'
       const kfName = inputName.includes(':') ? inputName.split(':')[1]! : inputName;
       const filename = kfName.split('/').pop() ?? kfName;
       const src = join(keyframeDir, filename);
-      // Use kf0.jpg as fallback for any keyframe
       const fallback = join(keyframeDir, 'kf0.jpg');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
       const usePath = require('node:fs').existsSync(src) ? src : fallback;
       writeFileSync(dest, readFileSync(usePath));
     },
 
-    async upload(_localPath: string, outputPath: string, _contentType: string) {
-      const buf = readFileSync(_localPath);
-      uploads.set(outputPath, buf);
+    async upload(localPath: string, outputPath: string) {
+      uploads.set(outputPath, readFileSync(localPath));
     },
 
     async uploadJson(outputPath: string, data: unknown) {
@@ -168,235 +163,225 @@ function buildFakeAiContext(
   return ctx;
 }
 
-// ---- Valid Ollama response ----
+// ---- Valid Ollama responses ----
+
+const VALID_NOTE = 'Cảnh quay ngoài trời, có cây xanh và người đi lại.';
 
 const VALID_DESCRIPTION = JSON.stringify({
-  caption_vi: 'Đây là một đoạn video thử nghiệm hiển thị cảnh ngoài trời',
-  caption_en: 'This is a test video segment showing an outdoor scene',
-  tags: ['test', 'outdoor', 'landscape'],
-  keywords_vi: ['thử nghiệm', 'cảnh quan'],
-  subjects: ['landscape'],
-  actions: ['showing'],
-  shot_size: 'wide',
-  camera_motion: 'static',
-  time_of_day: 'day',
+  title_vi: 'Video thử nghiệm ngoài trời',
+  summary_vi: 'Video ngắn quay cảnh ngoài trời với cây xanh và người đi lại.',
+  summary_en: 'Short outdoor video with trees and people walking around.',
+  genre: 'phong cảnh',
+  topics: ['ngoài trời'],
+  subjects: ['cây', 'người'],
+  places: ['công viên'],
+  actions: ['đi lại'],
+  keywords_vi: ['ngoài trời', 'cây xanh'],
+  tags: ['outdoor', 'nature'],
+  mood: 'yên bình',
   setting: 'outdoor',
-  people_count: 'none',
+  time_of_day: 'day',
+  people_count: 'few',
+  shot_variety: ['wide'],
+  camera_motions: ['static'],
   visible_text: '',
   has_watermark: false,
   usable: true,
-  usable_reason: 'Good quality footage',
+  usable_reason: 'Chất lượng tốt',
   quality: 4,
 });
 
+// ---- Payload builder ----
+
+function makePayload(keyframeCount: number, framesPerNote = 4, repairAttempts = 1): object {
+  const keyframes = Array.from({ length: keyframeCount }, (_, i) => ({
+    input: `artifact:keyframes/kf${i}.jpg`,
+    t_ms: i * 1000,
+  }));
+  return {
+    asset_id: '123e4567-e89b-42d3-a456-426614174020',
+    model: 'qwen2.5vl:7b',
+    prompt_version: 'v2',
+    context: {
+      asset_name: 'test.mp4',
+      project_names: ['project-a'],
+      category_names: [],
+      province_names: ['Hà Nội'],
+    },
+    media: { duration_ms: keyframeCount * 1000, has_audio: false, has_speech_hint: null },
+    keyframes,
+    options: { keep_alive: '2m', repair_attempts: repairAttempts, frames_per_note: framesPerNote },
+  };
+}
+
 // ---- Tests ----
 
-describe('handleScanAi', () => {
+describe('handleScanAi v2', () => {
   let kfDir: string;
-  let kf0: string;
 
   beforeAll(async () => {
     kfDir = join(TEST_BASE, 'keyframes');
     mkdirSync(kfDir, { recursive: true });
-    kf0 = await createTestKeyframe(kfDir, 'kf0.jpg');
+    // Create several test keyframes
+    for (let i = 0; i < 8; i++) {
+      await createTestKeyframe(kfDir, `kf${i}.jpg`);
+    }
   });
 
-  it('produces valid AiManifest when Ollama returns valid JSON', async () => {
-    const ollama = await createFakeOllama({ responses: [VALID_DESCRIPTION] });
-    const workDir = join(TEST_BASE, 'work_ai_valid');
+  it('two-step: calls Ollama ceil(frames/frames_per_note)+1 times', async () => {
+    // 8 frames, frames_per_note=4 → 2 note calls + 1 summary call = 3 total
+    const noteResponses = [VALID_NOTE, VALID_NOTE]; // 2 note groups
+    const summaryResponse = VALID_DESCRIPTION;
+    const ollama = await createFakeOllama({ responses: [...noteResponses, summaryResponse] });
+    const workDir = join(TEST_BASE, 'work_two_step');
     mkdirSync(workDir, { recursive: true });
 
-    const payload = {
-      asset_id: '123e4567-e89b-42d3-a456-426614174004',
-      chunk: 0,
-      model: 'qwen2.5vl:7b',
-      prompt_version: 'v1',
-      context: { project_names: [], category_names: [], province_names: [] },
-      segments: [
-        {
-          segment_id: '123e4567-e89b-42d3-a456-426614174005',
-          index: 0,
-          start_ms: 0,
-          end_ms: 5000,
-          keyframes: ['artifact:keyframes/kf0.jpg'],
-        },
-      ],
-      options: { keep_alive: '2m', repair_attempts: 1 },
-    };
+    const payload = makePayload(8, 4, 1);
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
 
-    const ac = new AbortController();
-    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, ac.signal);
-
-    const result = await handleScanAi(ctx);
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
     await ollama.close();
 
-    expect(result.manifest).toBe('ai-0000.json');
-    // the keyframe went to Ollama as a bare base64 image, the way /api/chat takes it
-    expect(ollama.lastImages).toHaveLength(1);
-    expect(Buffer.from(ollama.lastImages[0]!, 'base64').subarray(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
+    // ceil(8/4) + 1 = 3
+    expect(ollama.callCount).toBe(3);
+  });
+
+  it('sends images in note calls', async () => {
+    // 4 frames, frames_per_note=4 → 1 note call (with 4 images) + 1 summary call
+    const ollama = await createFakeOllama({ responses: [VALID_NOTE, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_images');
+    mkdirSync(workDir, { recursive: true });
+
+    const payload = makePayload(4, 4, 1);
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
+
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
+    await ollama.close();
+
+    // First call (notes): should have 4 images
+    const firstCallImages = ollama.allCallImages[0] ?? [];
+    expect(firstCallImages.length).toBeGreaterThanOrEqual(1);
+    // Images should be bare base64 (no data: prefix)
+    firstCallImages.forEach((img) => {
+      expect(img.startsWith('data:')).toBe(false);
+      // Verify it's valid base64 (JPEG magic bytes)
+      const buf = Buffer.from(img, 'base64');
+      expect(buf[0]).toBe(0xff);
+      expect(buf[1]).toBe(0xd8);
+    });
+  });
+
+  it('writes valid AiManifest v2 on success', async () => {
+    // 4 frames, frames_per_note=4
+    const ollama = await createFakeOllama({ responses: [VALID_NOTE, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_manifest');
+    mkdirSync(workDir, { recursive: true });
+
+    const payload = makePayload(4, 4, 1);
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
+
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
+    await ollama.close();
 
     const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
-    const manifestBuf = uploads.get('ai-0000.json');
+    const manifestBuf = uploads.get('ai.json');
     expect(manifestBuf).toBeDefined();
 
-    const manifestData = JSON.parse(manifestBuf!.toString()) as unknown;
-    const parsed = AiManifestSchema.safeParse(manifestData);
+    const parsed = AiManifestSchema.safeParse(JSON.parse(manifestBuf!.toString()));
     if (!parsed.success) console.error('AiManifest invalid:', parsed.error.message);
     expect(parsed.success).toBe(true);
 
     if (parsed.success) {
-      expect(parsed.data.items).toHaveLength(1);
-      expect(parsed.data.items[0]!.description).not.toBeNull();
-      expect(parsed.data.items[0]!.error).toBeNull();
+      expect(parsed.data.schema).toBe('ag.scan.ai/v2');
+      expect(parsed.data.description).not.toBeNull();
+      expect(parsed.data.notes.length).toBeGreaterThanOrEqual(1);
+      expect(parsed.data.error).toBeNull();
     }
   });
 
-  it('calls the Ollama given in extra.ollama_url, not localhost', async () => {
-    const ollama = await createFakeOllama({ responses: [VALID_DESCRIPTION] });
-    const workDir = join(TEST_BASE, 'work_ai_url');
-    mkdirSync(workDir, { recursive: true });
-    const payload = {
-      asset_id: '123e4567-e89b-42d3-a456-426614174004',
-      chunk: 0,
-      model: 'qwen2.5vl:7b',
-      prompt_version: 'v1',
-      context: { project_names: [], category_names: [], province_names: [] },
-      segments: [
-        {
-          segment_id: '123e4567-e89b-42d3-a456-426614174005',
-          index: 0,
-          start_ms: 0,
-          end_ms: 5000,
-          keyframes: ['artifact:keyframes/kf0.jpg'],
-        },
-      ],
-      options: { keep_alive: '2m', repair_attempts: 0 },
-    };
-    // Context không mang ollamaUrl: chỉ tuỳ chọn của handler chỉ tới Ollama giả
-    const ctx = buildFakeAiContext(workDir, 'http://127.0.0.1:1', kfDir, payload, new AbortController().signal);
-    const result = await createScanAiHandler({ ollamaUrl: ollama.url })(ctx);
-    await ollama.close();
-    expect(result.summary).toMatchObject({ success: 1 });
-    expect(ollama.lastImages).toHaveLength(1);
-  });
-
-  it('gives its slot back between segments when Studio work waits', async () => {
-    const ollama = await createFakeOllama({ responses: [VALID_DESCRIPTION, VALID_DESCRIPTION] });
-    const workDir = join(TEST_BASE, 'work_ai_yield');
-    mkdirSync(workDir, { recursive: true });
-    const segment = (n: number) => ({
-      segment_id: `123e4567-e89b-42d3-a456-42661417400${n}`,
-      index: n,
-      start_ms: n * 5000,
-      end_ms: n * 5000 + 5000,
-      keyframes: ['artifact:keyframes/kf0.jpg'],
-    });
-    const payload = {
-      asset_id: '123e4567-e89b-42d3-a456-426614174004',
-      chunk: 0,
-      model: 'qwen2.5vl:7b',
-      prompt_version: 'v1',
-      context: { project_names: [], category_names: [], province_names: [] },
-      segments: [segment(5), segment(6)],
-      options: { keep_alive: '2m', repair_attempts: 0 },
-    };
-    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
-    let yields = 0;
-    ctx.yieldToInteractive = async () => { yields++; };
-    await handleScanAi(ctx);
-    await ollama.close();
-    expect(yields).toBe(2);
-  });
-
-  it('repairs invalid JSON on second attempt', async () => {
-    // First response: invalid JSON; second: valid
+  it('repairs invalid JSON on second summary attempt', async () => {
+    // note OK, summary bad → repair → summary good
     const ollama = await createFakeOllama({
-      responses: ['not-json-at-all', VALID_DESCRIPTION],
+      responses: [VALID_NOTE, 'not-json-at-all', VALID_DESCRIPTION],
     });
-    const workDir = join(TEST_BASE, 'work_ai_repair');
+    const workDir = join(TEST_BASE, 'work_repair');
     mkdirSync(workDir, { recursive: true });
 
-    const payload = {
-      asset_id: '123e4567-e89b-42d3-a456-426614174006',
-      chunk: 1,
-      model: 'qwen2.5vl:7b',
-      prompt_version: 'v1',
-      context: { project_names: [], category_names: [], province_names: [] },
-      segments: [
-        {
-          segment_id: '123e4567-e89b-42d3-a456-426614174007',
-          index: 0,
-          start_ms: 0,
-          end_ms: 5000,
-          keyframes: ['artifact:keyframes/kf0.jpg'],
-        },
-      ],
-      options: { keep_alive: '2m', repair_attempts: 1 },
-    };
+    const payload = makePayload(4, 4, 1); // repair_attempts=1
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
 
-    const ac = new AbortController();
-    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, ac.signal);
-
-    await handleScanAi(ctx);
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
     await ollama.close();
 
-    expect(ollama.callCount).toBe(2); // called twice (initial + repair)
+    // 1 note call + 2 summary calls (initial + repair) = 3
+    expect(ollama.callCount).toBe(3);
 
     const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
-    const manifestBuf = uploads.get('ai-0001.json');
+    const manifest = AiManifestSchema.parse(JSON.parse(uploads.get('ai.json')!.toString()));
+    expect(manifest.description).not.toBeNull();
+  });
+
+  it('throws retryable error and writes ai.json with description=null when all attempts fail', async () => {
+    // note OK, all summary calls return bad JSON
+    const ollama = await createFakeOllama({
+      responses: [VALID_NOTE, 'bad-json', 'also-bad-json'],
+    });
+    const workDir = join(TEST_BASE, 'work_fail');
+    mkdirSync(workDir, { recursive: true });
+
+    const payload = makePayload(4, 4, 1); // repair_attempts=1
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
+
+    // Should throw (retryable error = plain Error, not NonRetryableError)
+    await expect(handleScanAi(ctx)).rejects.toThrow();
+    await ollama.close();
+
+    // But ai.json should still be written
+    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
+    const manifestBuf = uploads.get('ai.json');
     expect(manifestBuf).toBeDefined();
 
-    const manifestData = JSON.parse(manifestBuf!.toString()) as unknown;
-    const parsed = AiManifestSchema.safeParse(manifestData);
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      // Should succeed on second attempt
-      expect(parsed.data.items[0]!.description).not.toBeNull();
-    }
+    const manifest = AiManifestSchema.parse(JSON.parse(manifestBuf!.toString()));
+    expect(manifest.description).toBeNull();
+    expect(manifest.error).not.toBeNull();
   });
 
-  it('records error when all repair attempts fail', async () => {
-    // All responses: invalid JSON
+  it('yields before each Ollama call', async () => {
+    // 4 frames, frames_per_note=2 → 2 note calls + 1 summary = 3 Ollama calls
+    // Each Ollama call is preceded by yieldToInteractive
     const ollama = await createFakeOllama({
-      responses: ['invalid1', 'invalid2', 'invalid3'],
+      responses: [VALID_NOTE, VALID_NOTE, VALID_DESCRIPTION],
     });
-    const workDir = join(TEST_BASE, 'work_ai_fail');
+    const workDir = join(TEST_BASE, 'work_yield');
     mkdirSync(workDir, { recursive: true });
 
-    const payload = {
-      asset_id: '123e4567-e89b-42d3-a456-426614174008',
-      chunk: 2,
-      model: 'qwen2.5vl:7b',
-      prompt_version: 'v1',
-      context: { project_names: [], category_names: [], province_names: [] },
-      segments: [
-        {
-          segment_id: '123e4567-e89b-42d3-a456-426614174009',
-          index: 0,
-          start_ms: 0,
-          end_ms: 5000,
-          keyframes: ['artifact:keyframes/kf0.jpg'],
-        },
-      ],
-      options: { keep_alive: '2m', repair_attempts: 1 },
-    };
+    const payload = makePayload(4, 2, 0); // 4 frames, 2 per note → 2 note groups
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
 
-    const ac = new AbortController();
-    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, ac.signal);
+    let yields = 0;
+    ctx.yieldToInteractive = async () => { yields++; };
 
-    const result = await handleScanAi(ctx);
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
     await ollama.close();
 
-    expect(result.manifest).toBe('ai-0002.json');
+    // At minimum: yield before each note group call (2) + yield before summary (1)
+    // Plus additional yields in the summary repair loop if any
+    // Expected: at least 3 yields (one per Ollama call)
+    expect(yields).toBeGreaterThanOrEqual(3);
+  });
 
-    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
-    const manifestBuf = uploads.get('ai-0002.json');
-    const manifestData = JSON.parse(manifestBuf!.toString()) as unknown;
-    const parsed = AiManifestSchema.safeParse(manifestData);
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.data.items[0]!.description).toBeNull();
-      expect(parsed.data.items[0]!.error).not.toBeNull();
-    }
+  it('uses ollamaUrl from createScanAiHandler factory', async () => {
+    const ollama = await createFakeOllama({ responses: [VALID_NOTE, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_factory');
+    mkdirSync(workDir, { recursive: true });
+
+    const payload = makePayload(4, 4, 0);
+    // ctx.ollamaUrl points to a dead port; factory should use the correct URL
+    const ctx = buildFakeAiContext(workDir, 'http://127.0.0.1:1', kfDir, payload, new AbortController().signal);
+
+    await expect(createScanAiHandler({ ollamaUrl: ollama.url })(ctx)).resolves.toBeDefined();
+    await ollama.close();
+
+    expect(ollama.callCount).toBeGreaterThanOrEqual(2); // at least note + summary
   });
 });

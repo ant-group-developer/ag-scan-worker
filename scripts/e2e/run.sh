@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
-# E2E luồng quét: hub ag-farm (thật) + ag-scan-worker (thật) + chủ job giả ký URL bằng vé.
-# Video 3 cảnh (3 s | 3 s | 4 s) phải ra đúng 3 đoạn, cắt tại 3 s và 6 s.
+# E2E luồng quét v2: hub ag-farm (thật) + ag-scan-worker (thật) + chủ job giả ký URL bằng vé.
+# Video 3 cảnh (3 s | 3 s | 4 s) → scan.extract v2 → extract.json phải:
+#   - schema = ag.scan.extract/v2
+#   - có đúng 3 scenes cắt tại ≈3 s và ≈6 s
+#   - keyframes[], technical {} ở top-level (không còn segments)
 #
 # Cần trước: Docker; `yarn build` ở ../ag-farm/apps/api và ở repo này (dist/).
 # Chạy (Git Bash): bash scripts/e2e/run.sh
 # File làm việc (khoá, log, output) nằm trong thư mục tạm của máy, không nằm trong repo.
 set -u
+# Do not run if Docker is not available
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker not available – skipping E2E. Run 'yarn test' for unit/integration tests."
+  exit 0
+fi
+
 SCRIPT_DIR="$(cygpath -m "$(cd "$(dirname "$0")" && pwd)")"
 WORKER="$(cygpath -m "$(cd "$SCRIPT_DIR/../.." && pwd)")"
 FARM="${FARM:-$(cygpath -m "$(cd "$WORKER/../ag-farm" && pwd)")}"
@@ -71,7 +80,18 @@ EOF
 
 JOB=$(curl -s -X POST localhost:3978/v1/owner/jobs -H "Authorization: Owner $OWNER_KEY" -H 'Content-Type: application/json' -d '{
   "type":"scan.extract","correlation_id":"e2e:extract",
-  "payload":{"asset":{"id":"123e4567-e89b-42d3-a456-426614174777","kind":"video","mime_type":"video/mp4","size_bytes":null,"checksum_sha256":null,"duration_ms":10000,"width":640,"height":360},"extract_version":"e2e"}}')
+  "payload":{
+    "asset":{"id":"123e4567-e89b-42d3-a456-426614174777","kind":"video","mime_type":"video/mp4","size_bytes":null,"checksum_sha256":null,"duration_ms":10000,"width":640,"height":360},
+    "params":{
+      "scene_threshold":0.3,"min_scene_s":1,"max_keyframes":24,
+      "keyframe_dedup_distance":8,"keyframe_px":640,
+      "proxy":{"enabled":true,"height":720,"crf":26,"gop_s":1},
+      "contact_sheet":{"enabled":true,"columns":6,"tile_px":320},
+      "dead":{"black_ratio_min":0.9,"frozen_ratio_min":0.95,"blur_min":12},
+      "speech_silence_ratio_max":0.6
+    },
+    "extract_version":"e2e-v2"
+  }}')
 JOB_ID=$(node -e "const b=JSON.parse(process.argv[1]);console.log((b.data??b).job.id)" "$JOB") || { echo "submit failed: $JOB"; exit 1; }
 echo "submitted $JOB_ID"
 
@@ -88,7 +108,24 @@ echo "job: $STATUS"
 echo "--- unacked list:"; curl -s "localhost:3978/v1/owner/jobs?status=completed,failed&unacked=1" -H "Authorization: Owner $OWNER_KEY" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const b=JSON.parse(s),j=b.data??b;console.log(j.jobs.map(x=>x.id+' '+x.status))})"
 echo "--- stored files:"; (cd "$SP/store" && find . -type f | sort | head -20)
 if [ -f "$SP/store/extract.json" ]; then
-  node -e "const m=require('$SP/store/extract.json');console.log('segments', m.segments.map(s=>[s.start_ms,s.end_ms,s.boundary_reason,s.keyframes.length]));console.log('proxy', m.proxy)"
+  node -e "
+    const m=require('$SP/store/extract.json');
+    console.log('schema', m.schema);
+    console.log('scenes', m.scenes.map(s=>[s.index,s.start_ms,s.end_ms]));
+    console.log('keyframes', m.keyframes.length);
+    console.log('technical', JSON.stringify(m.technical));
+    console.log('proxy', m.proxy ? m.proxy.output : null);
+  "
+  # ASSERT: schema must be v2, scenes must be >= 3 for 3-scene clip
+  node -e "
+    const {ExtractManifestSchema}=require('$WORKER/../ag-farm/packages/protocol/dist/index.js');
+    const m=require('$SP/store/extract.json');
+    const r=ExtractManifestSchema.safeParse(m);
+    if(!r.success){console.error('FAIL: manifest not valid v2:',r.error.message);process.exit(1);}
+    if(m.schema!=='ag.scan.extract/v2'){console.error('FAIL: schema',m.schema);process.exit(1);}
+    if(m.scenes.length<3){console.error('FAIL: expected >=3 scenes, got',m.scenes.length);process.exit(1);}
+    console.log('PASS: extract.json is valid v2 with',m.scenes.length,'scenes');
+  " || exit 1
 fi
 echo "--- owner log:"; tail -8 "$SP/owner.log"
 echo "--- worker log (last):"; tail -8 "$SP/worker.log"

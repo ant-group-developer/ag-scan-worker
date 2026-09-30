@@ -23,5 +23,7 @@ cache:
 # schedule:
 #   - { days: [1, 2, 3, 4, 5], from: '19:00', to: '07:00' }
 
-# scan.ai gọi Ollama ở http://localhost:11434; model do ag-go-api gửi trong job (ANALYSIS_MODEL,
-# mặc định qwen2.5vl:7b) nên máy phải `ollama pull` đúng model đó.
+# scan.ai (v2) gọi Ollama ở http://localhost:11434 bằng hai bước: ghi chú keyframe theo nhóm
+# rồi tổng hợp một AssetDescription cho cả video. Model do ag-go-api gửi trong job
+# (ANALYSIS_MODEL, mặc định qwen2.5vl:7b) nên máy phải `ollama pull` đúng model đó.
+# scan.extract (v2) xử lý cả video (không chia footage): cảnh chỉ dùng để chọn keyframe đại diện.

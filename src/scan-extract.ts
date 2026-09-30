@@ -1,6 +1,10 @@
 /**
- * Handler scan.extract: tải file gốc → ffprobe → proxy 720p → dò cảnh →
- * chia đoạn → keyframe + dHash → contact sheet → chỉ số kỹ thuật → upload.
+ * Handler scan.extract v2: tải file gốc → ffprobe → proxy 720p → dò cảnh →
+ * keyframe đại diện mỗi cảnh (cạnh dài keyframe_px, bỏ trùng dHash) →
+ * chỉ số kỹ thuật cả video → contact sheet → upload manifest.
+ *
+ * Không còn chia đoạn (segment): cảnh chỉ để chọn keyframe đại diện;
+ * mô tả và chỉ số kỹ thuật tính cho cả file.
  */
 import { statSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -13,7 +17,7 @@ import {
   EXTRACT_MANIFEST_SCHEMA,
   EXTRACT_MANIFEST_PATH,
 } from '@ag-farm/protocol';
-import type { ExtractManifest, ExtractSegment, Keyframe, SegmentTechnical } from '@ag-farm/protocol';
+import type { ExtractManifest, Keyframe, Scene, AssetTechnical } from '@ag-farm/protocol';
 import type { JobResult } from '@ag-farm/protocol';
 import type { JobContext } from '@ag-farm/worker-sdk';
 import { NonRetryableError } from '@ag-farm/worker-sdk';
@@ -26,7 +30,7 @@ import {
   resolveFfmpeg,
   resolveFfprobe,
 } from './ffmpeg-utils';
-import { buildSegments } from './segmentation';
+import { hammingDistance } from './segmentation';
 import { computeDhash } from './dhash';
 import type { Logger } from '@ag-farm/worker-sdk';
 
@@ -37,8 +41,7 @@ const execFileAsync = promisify(execFile);
 let _nvdecAvailable: boolean | null = null;
 
 /**
- * NVDEC dùng được khi ffmpeg có hwaccel cuda VÀ máy thật sự có GPU NVIDIA: bản ffmpeg dựng sẵn
- * luôn liệt kê `cuda` kể cả trên máy không có card.
+ * NVDEC dùng được khi ffmpeg có hwaccel cuda VÀ máy thật sự có GPU NVIDIA.
  */
 async function isNvdecAvailable(): Promise<boolean> {
   if (_nvdecAvailable !== null) return _nvdecAvailable;
@@ -88,8 +91,84 @@ async function getFfmpegVersion(ffmpeg: string): Promise<string | null> {
   }
 }
 
+// ---- Concurrency helpers ----
+
+/**
+ * Chạy các task không quá `limit` task đồng thời, giữ thứ tự kết quả.
+ */
+async function withConcurrencyLimit<T>(tasks: Array<() => Promise<T>>, limit: number): Promise<T[]> {
+  const results: T[] = new Array(tasks.length) as T[];
+  let nextIdx = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const idx = nextIdx++;
+      if (idx >= tasks.length) return;
+      results[idx] = await tasks[idx]!();
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+/** Chọn n phần tử rải đều từ mảng theo chỉ số. */
+function pickEvenly<T>(items: T[], n: number): T[] {
+  if (items.length <= n) return [...items];
+  const result: T[] = [];
+  for (let i = 0; i < n; i++) {
+    const idx = n === 1 ? 0 : Math.round(i * (items.length - 1) / (n - 1));
+    result.push(items[idx]!);
+  }
+  return result;
+}
+
+// ---- Scene building ----
+
+/**
+ * Xây danh sách cảnh từ các mốc cắt, gộp cảnh ngắn hơn minSceneMs vào cảnh trước.
+ */
+function buildScenes(
+  cuts: number[],
+  durationMs: number,
+  minSceneMs: number,
+): Array<{ start_ms: number; end_ms: number }> {
+  if (durationMs <= 0) return [{ start_ms: 0, end_ms: 0 }];
+
+  // Biên giới: 0, các cắt dương < duration, duration
+  const bounds = [
+    ...new Set([0, ...cuts.filter((t) => t > 0 && t < durationMs), durationMs]),
+  ].sort((a, b) => a - b);
+
+  if (bounds.length < 2) return [{ start_ms: 0, end_ms: durationMs }];
+
+  // Cảnh thô
+  const raw: Array<{ start_ms: number; end_ms: number }> = [];
+  for (let i = 0; i + 1 < bounds.length; i++) {
+    raw.push({ start_ms: bounds[i]!, end_ms: bounds[i + 1]! });
+  }
+
+  // Gộp cảnh ngắn hơn minSceneMs vào cảnh trước
+  const merged: Array<{ start_ms: number; end_ms: number }> = [];
+  for (const scene of raw) {
+    const len = scene.end_ms - scene.start_ms;
+    if (merged.length > 0 && len < minSceneMs) {
+      merged[merged.length - 1]!.end_ms = scene.end_ms;
+    } else {
+      merged.push({ ...scene });
+    }
+  }
+
+  return merged.length > 0 ? merged : [{ start_ms: 0, end_ms: durationMs }];
+}
+
 // ---- Contact sheet ----
 
+/**
+ * Tạo contact sheet từ danh sách keyframe; mỗi ô giữ tỉ lệ khung của ảnh (fit:inside),
+ * không cắt. Cạnh dài của ô = tilePx.
+ */
 async function buildContactSheet(
   keyframePaths: string[],
   outputPath: string,
@@ -107,12 +186,30 @@ async function buildContactSheet(
   for (let i = 0; i < keyframePaths.length; i++) {
     const col = i % columns;
     const row = Math.floor(i / columns);
+
+    // Đọc kích thước ảnh gốc rồi tính tile size giữ tỉ lệ, cạnh dài = tilePx
+    const meta = await sharp(keyframePaths[i]!).metadata();
+    const iw = meta.width ?? 1;
+    const ih = meta.height ?? 1;
+
+    let tileW: number, tileH: number;
+    if (iw >= ih) {
+      tileW = tilePx;
+      tileH = Math.max(1, Math.round((ih * tilePx) / iw));
+    } else {
+      tileH = tilePx;
+      tileW = Math.max(1, Math.round((iw * tilePx) / ih));
+    }
+
     const tileBuffer = await sharp(keyframePaths[i]!)
-      .resize(tilePx, tilePx, { fit: 'cover' })
+      .resize(tileW, tileH, { fit: 'fill' })
       .jpeg({ quality: 80 })
       .toBuffer();
 
-    composites.push({ input: tileBuffer, left: col * tilePx, top: row * tilePx });
+    // Căn giữa ô tilePx × tilePx
+    const offsetX = col * tilePx + Math.floor((tilePx - tileW) / 2);
+    const offsetY = row * tilePx + Math.floor((tilePx - tileH) / 2);
+    composites.push({ input: tileBuffer, left: offsetX, top: offsetY });
   }
 
   await sharp({
@@ -139,12 +236,17 @@ async function handleStaticImage(
   const { width, height, rotation } = mediaInfo;
   ctx.progress(30, 'keyframe');
 
-  const kfRelPath = 'keyframes/0001-1.jpg';
+  const kfRelPath = 'keyframes/0001.jpg';
   const kfLocalPath = join(workDir, kfRelPath);
   mkdirSync(join(workDir, 'keyframes'), { recursive: true });
 
+  const isPortrait = height > width;
   await sharp(sourceLocalPath)
-    .resize(params.keyframe_px, params.keyframe_px, { fit: 'inside' })
+    .resize(
+      isPortrait ? undefined : params.keyframe_px,
+      isPortrait ? params.keyframe_px : undefined,
+      { fit: 'inside' },
+    )
     .jpeg({ quality: 85 })
     .toFile(kfLocalPath);
 
@@ -152,26 +254,33 @@ async function handleStaticImage(
   const kfDhash = await safeDhash(kfLocalPath);
   await ctx.upload(kfLocalPath, kfRelPath, 'image/jpeg');
 
-  const kf: Keyframe = { output: kfRelPath, t_ms: 0, width: kfW, height: kfH, dhash: kfDhash };
-
-  const technical: SegmentTechnical = {
-    brightness: null, blur: null, black_ratio: 0, frozen_ratio: 0,
-    silence_ratio: null, dead: false, dead_reason: null,
+  const kf: Keyframe = {
+    output: kfRelPath,
+    t_ms: 0,
+    width: kfW,
+    height: kfH,
+    dhash: kfDhash,
+    scene_index: 0,
   };
 
-  const seg: ExtractSegment = {
-    index: 0, start_ms: 0, end_ms: 0, boundary_reason: 'still',
-    orientation: orientationOf(kfW, kfH), keyframes: [kf], technical,
+  const scene: Scene = { index: 0, start_ms: 0, end_ms: 0 };
+
+  const technical: AssetTechnical = {
+    brightness: null,
+    blur: null,
+    black_ratio: 0,
+    frozen_ratio: 0,
+    silence_ratio: null,
+    has_speech_hint: null,
+    dead: false,
+    dead_reason: null,
   };
 
   let contactSheet: ExtractManifest['contact_sheet'] = null;
   if (params.contact_sheet.enabled) {
     ctx.progress(60, 'contact_sheet');
     const csPath = join(workDir, 'contact_sheet.jpg');
-    await sharp(kfLocalPath)
-      .resize(params.contact_sheet.tile_px, params.contact_sheet.tile_px, { fit: 'cover' })
-      .jpeg({ quality: 80 })
-      .toFile(csPath);
+    await buildContactSheet([kfLocalPath], csPath, 1, params.contact_sheet.tile_px);
     await ctx.upload(csPath, 'contact_sheet.jpg', 'image/jpeg');
     contactSheet = { output: 'contact_sheet.jpg', columns: 1, rows: 1 };
   }
@@ -181,9 +290,12 @@ async function handleStaticImage(
     asset_id: assetId,
     extract_version: extractVersion,
     media: { kind: 'image', duration_ms: 0, width, height, fps: null, has_audio: false, rotation },
+    orientation: orientationOf(width, height),
     proxy: null,
     contact_sheet: contactSheet,
-    segments: [seg],
+    scenes: [scene],
+    keyframes: [kf],
+    technical,
     tools: { ffmpeg: ffmpegVersion, worker_version: extractVersion },
   };
 
@@ -194,7 +306,7 @@ async function handleStaticImage(
 
   return {
     manifest: EXTRACT_MANIFEST_PATH,
-    summary: { segments: 1, kind: 'image', proxy: false },
+    summary: { scenes: 1, keyframes: 1, kind: 'image', proxy: false },
   };
 }
 
@@ -220,7 +332,6 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
   // Tải file gốc
   const sourceLocalPath = join(workDir, 'source_original');
   await ctx.download('source', sourceLocalPath);
-  // Việc Studio trên máy được ưu tiên: nhường slot trước mỗi bước nặng.
   await ctx.yieldToInteractive();
   ctx.progress(15, 'probe');
 
@@ -230,10 +341,12 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
 
   const { kind, duration_ms, width, height, fps, has_audio, rotation, start_time_ms } = mediaInfo;
 
-  // Ảnh tĩnh. ffprobe coi PNG/JPEG là luồng video một khung (thời lượng 0), nên dựa vào loại asset
-  // mà chủ job gửi, và coi mọi media không có thời lượng là ảnh.
+  // Ảnh tĩnh
   if (asset.kind === 'image' || kind === 'image' || duration_ms <= 0) {
-    return handleStaticImage(ctx, asset.id, extract_version, sourceLocalPath, workDir, mediaInfo, params, ffmpegVersion, log);
+    return handleStaticImage(
+      ctx, asset.id, extract_version, sourceLocalPath, workDir,
+      mediaInfo, params, ffmpegVersion, log,
+    );
   }
 
   // Proxy 720p
@@ -266,131 +379,154 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
   ctx.progress(40, 'scene_detect');
   const analyzeSource = proxyInfo ? proxyPath : sourceLocalPath;
   const sceneStartMs = proxyInfo ? 0 : start_time_ms;
-  const sceneCuts = await detectSceneChanges(analyzeSource, ffmpeg, params.scene_threshold, sceneStartMs, log);
+
+  // Khi proxy tồn tại, dùng kích thước proxy để xác định orientation của keyframe
+  const analyzeWidth = proxyInfo ? proxyInfo.width : width;
+  const analyzeHeight = proxyInfo ? proxyInfo.height : height;
+  const isPortrait = analyzeHeight > analyzeWidth;
+
+  const sceneCuts = await detectSceneChanges(
+    analyzeSource, ffmpeg, params.scene_threshold, sceneStartMs, log,
+  );
   log.info(`Detected ${sceneCuts.length} scene cuts`);
 
-  // Pre-compute dHash cho midpoints
-  ctx.progress(45, 'segmentation');
-  const windowMs = Math.round(params.window_s * 1000);
-  const maxSegMs = Math.round(params.max_segment_s * 1000);
-  const minSegMs = Math.round(params.min_segment_s * 1000);
+  // Xây danh sách cảnh, gộp cảnh ngắn hơn min_scene_s
+  const minSceneMs = Math.round(params.min_scene_s * 1000);
+  const rawScenes = buildScenes(sceneCuts, duration_ms, minSceneMs);
+  const scenes: Scene[] = rawScenes.map((s, idx) => ({ index: idx, ...s }));
+  log.info(`Built ${scenes.length} scenes`);
 
-  const dhashCache = new Map<number, string>();
-  const cuts = [...new Set([0, ...sceneCuts, duration_ms])].sort((a, b) => a - b);
-  const midpoints: number[] = [];
-  let cur = 0;
-  while (cur < duration_ms) {
-    const nextCut = cuts.find((c) => c > cur);
-    const windowEnd = cur + windowMs;
-    const end = nextCut !== undefined && nextCut <= windowEnd ? nextCut : Math.min(windowEnd, duration_ms);
-    midpoints.push(Math.round((cur + end) / 2));
-    cur = end;
+  // Trích một keyframe đại diện mỗi cảnh (giữa cảnh)
+  ctx.progress(45, 'keyframes');
+  mkdirSync(join(workDir, 'keyframes'), { recursive: true });
+
+  interface CandidateKf {
+    sceneIndex: number;
+    tMs: number;
+    relPath: string;
+    localPath: string;
   }
 
-  await Promise.all(midpoints.map(async (t) => {
-    const tmpFrame = join(workDir, `dhash_${t}.jpg`);
-    try {
-      await extractKeyframe(analyzeSource, tmpFrame, t / 1000, 64);
-      dhashCache.set(t, await safeDhash(tmpFrame));
-    } catch {
-      dhashCache.set(t, '0000000000000000');
-    }
-  }));
+  const candidateTasks: Array<() => Promise<CandidateKf | null>> = scenes.map((scene, si) => async () => {
+    const tMs = scene.end_ms > scene.start_ms
+      ? Math.round((scene.start_ms + scene.end_ms) / 2)
+      : scene.start_ms;
 
-  const segments = buildSegments({
-    duration_ms,
-    scene_cuts_ms: sceneCuts,
-    window_ms: windowMs,
-    max_segment_ms: maxSegMs,
-    min_segment_ms: minSegMs,
-    merge_dhash_max_distance: params.merge_dhash_max_distance,
-    getDhash: (t) => dhashCache.get(t) ?? '0000000000000000',
+    const relPath = `keyframes/${zeroPad(si + 1)}.jpg`;
+    const localPath = join(workDir, relPath);
+
+    try {
+      await extractKeyframe(
+        analyzeSource, localPath, tMs / 1000, params.keyframe_px,
+        analyzeWidth, analyzeHeight,
+      );
+      return { sceneIndex: si, tMs, relPath, localPath };
+    } catch (err) {
+      log.warn(`Keyframe extraction failed for scene ${si} at t=${tMs}ms`, { error: String(err) });
+      return null;
+    }
   });
 
-  log.info(`Built ${segments.length} segments`);
-  await ctx.yieldToInteractive();
-  ctx.progress(50, 'keyframes');
+  // Bắt đầu với khả năng timeout; giới hạn 4 ffmpeg đồng thời
+  const candidateResults = await withConcurrencyLimit(candidateTasks, 4);
 
-  // Trích keyframe + tech metrics
-  mkdirSync(join(workDir, 'keyframes'), { recursive: true });
-  const extractedSegments: ExtractSegment[] = [];
-  const allKeyframePaths: string[] = [];
-
-  for (let si = 0; si < segments.length; si++) {
-    await ctx.yieldToInteractive();
-    const seg = segments[si]!;
-    const segDuration = seg.end_ms - seg.start_ms;
-    const segStartSec = seg.start_ms / 1000;
-    const segEndSec = seg.end_ms / 1000;
-
-    const kfCount = params.keyframes_per_segment;
-    const kfTimes: number[] = [];
-    for (let k = 0; k < kfCount; k++) {
-      const frac = kfCount === 1 ? 0.5 : k / (kfCount - 1);
-      const tMs = seg.start_ms + Math.round(frac * segDuration * 0.9 + segDuration * 0.05);
-      kfTimes.push(Math.min(tMs, Math.max(seg.start_ms, seg.end_ms - 50)));
-    }
-
-    const keyframes: Keyframe[] = [];
-    for (let ki = 0; ki < kfTimes.length; ki++) {
-      const tMs = kfTimes[ki]!;
-      const kfRelPath = `keyframes/${zeroPad(si + 1)}-${ki + 1}.jpg`;
-      const kfLocalPath = join(workDir, kfRelPath);
-
-      await extractKeyframe(analyzeSource, kfLocalPath, tMs / 1000, params.keyframe_px);
-
-      const { width: kfW, height: kfH } = await imageSize(kfLocalPath);
-      const kfDhash = await safeDhash(kfLocalPath);
-      await ctx.upload(kfLocalPath, kfRelPath, 'image/jpeg');
-      allKeyframePaths.push(kfLocalPath);
-
-      keyframes.push({ output: kfRelPath, t_ms: tMs, width: kfW, height: kfH, dhash: kfDhash });
-    }
-
-    const tech = await getTechMetrics(analyzeSource, segStartSec, segEndSec, has_audio, log);
-
-    let dead = false;
-    let dead_reason: SegmentTechnical['dead_reason'] = null;
-    if (tech.black_ratio >= params.dead.black_ratio_min) {
-      dead = true; dead_reason = 'black';
-    } else if (tech.frozen_ratio >= params.dead.frozen_ratio_min) {
-      dead = true; dead_reason = 'frozen';
-    } else if (tech.blur !== null && tech.blur >= params.dead.blur_min) {
-      dead = true; dead_reason = 'blurry';
-    }
-
-    const technical: SegmentTechnical = {
-      brightness: tech.brightness,
-      blur: tech.blur,
-      black_ratio: tech.black_ratio,
-      frozen_ratio: tech.frozen_ratio,
-      silence_ratio: tech.silence_ratio,
-      dead,
-      dead_reason,
-    };
-
-    const kf0 = keyframes[0]!;
-    extractedSegments.push({
-      index: seg.index,
-      start_ms: seg.start_ms,
-      end_ms: seg.end_ms,
-      boundary_reason: seg.boundary_reason,
-      orientation: orientationOf(kf0.width, kf0.height),
-      keyframes,
-      technical,
-    });
-
-    ctx.progress(50 + Math.round(45 * (si + 1) / segments.length), 'keyframes');
+  // Đọc kích thước và dHash cho các keyframe trích được
+  interface KfWithHash {
+    sceneIndex: number;
+    tMs: number;
+    relPath: string;
+    localPath: string;
+    width: number;
+    height: number;
+    dhash: string;
   }
+
+  const candidates: KfWithHash[] = [];
+  for (const c of candidateResults) {
+    if (c === null) continue;
+    const { width: kfW, height: kfH } = await imageSize(c.localPath);
+    const dhash = await safeDhash(c.localPath);
+    candidates.push({ ...c, width: kfW, height: kfH, dhash });
+  }
+
+  // dHash dedup: bỏ keyframe trùng với keyframe đã giữ
+  const kept: KfWithHash[] = [];
+  for (const c of candidates) {
+    const isDup = kept.some(
+      (k) => hammingDistance(c.dhash, k.dhash) <= params.keyframe_dedup_distance,
+    );
+    if (!isDup) kept.push(c);
+  }
+
+  // Nếu vẫn nhiều hơn max_keyframes: rải đều theo thứ tự thời gian
+  const final = pickEvenly(kept, params.max_keyframes);
+
+  // Ensure có ít nhất 1 keyframe
+  if (final.length === 0 && candidates.length > 0) {
+    final.push(candidates[0]!);
+  }
+
+  if (final.length === 0) {
+    throw new Error('No keyframes could be extracted from the video');
+  }
+
+  // Upload keyframes
+  await ctx.yieldToInteractive();
+  ctx.progress(55, 'upload_keyframes');
+  const keyframes: Keyframe[] = [];
+  const allLocalKfPaths: string[] = [];
+
+  for (const kf of final) {
+    await ctx.upload(kf.localPath, kf.relPath, 'image/jpeg');
+    allLocalKfPaths.push(kf.localPath);
+    keyframes.push({
+      output: kf.relPath,
+      t_ms: kf.tMs,
+      width: kf.width,
+      height: kf.height,
+      dhash: kf.dhash,
+      scene_index: kf.sceneIndex,
+    });
+  }
+
+  // Chỉ số kỹ thuật cả video trong MỘT lần chạy ffmpeg
+  await ctx.yieldToInteractive();
+  ctx.progress(70, 'technical_metrics');
+  const tech = await getTechMetrics(analyzeSource, 0, duration_ms / 1000, has_audio, log);
+
+  const has_speech_hint = has_audio
+    ? (tech.silence_ratio !== null ? tech.silence_ratio < params.speech_silence_ratio_max : null)
+    : null;
+
+  let dead = false;
+  let dead_reason: AssetTechnical['dead_reason'] = null;
+  if (tech.black_ratio >= params.dead.black_ratio_min) {
+    dead = true; dead_reason = 'black';
+  } else if (tech.frozen_ratio >= params.dead.frozen_ratio_min) {
+    dead = true; dead_reason = 'frozen';
+  } else if (tech.blur !== null && tech.blur >= params.dead.blur_min) {
+    dead = true; dead_reason = 'blurry';
+  }
+
+  const technical: AssetTechnical = {
+    brightness: tech.brightness,
+    blur: tech.blur,
+    black_ratio: tech.black_ratio,
+    frozen_ratio: tech.frozen_ratio,
+    silence_ratio: tech.silence_ratio,
+    has_speech_hint,
+    dead,
+    dead_reason,
+  };
 
   // Contact sheet
   let contactSheet: ExtractManifest['contact_sheet'] = null;
-  if (params.contact_sheet.enabled && allKeyframePaths.length > 0) {
-    ctx.progress(95, 'contact_sheet');
+  if (params.contact_sheet.enabled && allLocalKfPaths.length > 0) {
+    ctx.progress(90, 'contact_sheet');
     const csPath = join(workDir, 'contact_sheet.jpg');
     const { columns } = params.contact_sheet;
-    const rows = Math.ceil(allKeyframePaths.length / columns);
-    await buildContactSheet(allKeyframePaths, csPath, columns, params.contact_sheet.tile_px);
+    const rows = Math.ceil(allLocalKfPaths.length / columns);
+    await buildContactSheet(allLocalKfPaths, csPath, columns, params.contact_sheet.tile_px);
     await ctx.upload(csPath, 'contact_sheet.jpg', 'image/jpeg');
     contactSheet = { output: 'contact_sheet.jpg', columns, rows };
   }
@@ -408,9 +544,12 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
       has_audio,
       rotation,
     },
+    orientation: orientationOf(width, height),
     proxy: proxyInfo,
     contact_sheet: contactSheet,
-    segments: extractedSegments,
+    scenes,
+    keyframes,
+    technical,
     tools: { ffmpeg: ffmpegVersion, worker_version: extract_version },
   };
 
@@ -418,12 +557,13 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
   ctx.progress(98, 'upload_manifest');
   await ctx.uploadJson(EXTRACT_MANIFEST_PATH, validated);
 
-  log.info('scan.extract done', { segments: extractedSegments.length });
+  log.info('scan.extract done', { scenes: scenes.length, keyframes: keyframes.length });
 
   return {
     manifest: EXTRACT_MANIFEST_PATH,
     summary: {
-      segments: extractedSegments.length,
+      scenes: scenes.length,
+      keyframes: keyframes.length,
       duration_ms,
       kind,
       proxy: proxyInfo !== null,

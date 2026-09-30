@@ -1,7 +1,10 @@
 # ag-scan-worker
 
 Worker quét footage cho máy cấu hình cao trong hệ thống [ag-farm](https://github.com/your-org/ag-farm).  
-Xử lý hai loại job: **scan.extract** (proxy + phân đoạn + keyframe) và **scan.ai** (Ollama Qwen-VL mô tả).
+Xử lý hai loại job: **scan.extract** (proxy + phát hiện cảnh + keyframe cả video) và **scan.ai** (Ollama Qwen-VL mô tả cả video).
+
+> **v2**: scan.extract không còn chia đoạn footage — nó mô tả cả file. Cảnh chỉ dùng để chọn keyframe đại diện.
+> scan.ai làm việc theo hai bước: ghi chú từng nhóm keyframe rồi viết một `AssetDescription` cho cả video.
 
 ---
 
@@ -245,15 +248,8 @@ yarn test
 
 ## Golden set (đánh giá mô tả AI)
 
-```bash
-# Tạo file golden.json (xem src/eval/run_golden.ts cho schema)
-npx ts-node src/eval/run_golden.ts \
-  --golden eval/golden.json \
-  --model qwen2.5vl:7b \
-  --out eval-output
-
-# Kết quả: eval-output/report.csv + eval-output/report.json
-```
+`src/eval/run_golden.ts` đã bị bỏ trong v2 (xem comment trong file). Công cụ đánh giá mới
+(`run_golden_v2.ts`) cần viết lại khi schema `AssetDescription` và prompt ổn định.
 
 ---
 
@@ -284,19 +280,19 @@ ag-scan-worker
     └── main.js            # Build output
 ```
 
-**Luồng scan.extract**:
+**Luồng scan.extract** (v2):
 1. Tải file gốc (cache nếu có cache_key)
 2. ffprobe → media info
 3. ffmpeg proxy 720p (H.264 CRF, NVDEC nếu có)
-4. Dò cảnh trên proxy
-5. Chia đoạn theo window + scene cut → gộp dHash gần nhau
-6. Trích keyframe mỗi đoạn → dHash, kích thước
-7. Chỉ số kỹ thuật: brightness, blur, black, freeze, silence
-8. Contact sheet
-9. Upload tất cả → upload `extract.json`
+4. Dò cảnh trên proxy → danh sách scenes (gộp cảnh ngắn hơn `min_scene_s`)
+5. Trích một keyframe đại diện mỗi cảnh (giữa cảnh); cạnh dài = `keyframe_px`; bỏ trùng dHash
+6. Chỉ số kỹ thuật cả video (một lần): brightness, blur, black, freeze, silence
+7. Contact sheet (tiles giữ tỉ lệ, không cắt)
+8. Upload tất cả → upload `extract.json` (schema `ag.scan.extract/v2`)
 
-**Luồng scan.ai**:
-1. Tải keyframe từ artifact
-2. Encode base64 → gọi Ollama `/api/chat` với JSON Schema format
-3. Validate `SegmentDescriptionSchema`; repair nếu sai
-4. Upload `ai-NNNN.json`
+**Luồng scan.ai** (v2):
+1. Tải tất cả keyframe từ artifact
+2. **Bước 1 – Ghi chú**: xem keyframe theo nhóm `frames_per_note`, viết ghi chú tiếng Việt cho mỗi nhóm
+3. **Bước 2 – Tóm tắt**: dùng tất cả ghi chú + tối đa 4 keyframe đại diện + ngữ cảnh → `AssetDescription` JSON
+4. Validate `AssetDescriptionSchema`; repair loop nếu sai JSON
+5. Upload `ai.json` (schema `ag.scan.ai/v2`); ném lỗi retryable nếu mô tả thất bại
