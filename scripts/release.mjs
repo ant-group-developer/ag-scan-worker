@@ -12,9 +12,8 @@
  */
 import { build } from 'esbuild';
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
@@ -59,15 +58,15 @@ writeFileSync(
 
 cpSync(join(root, 'deploy'), join(out, 'deploy'), { recursive: true });
 
-const zip = `${out}.zip`;
-rmSync(zip, { force: true });
-try {
-  // bsdtar (Windows 10+, macOS) và GNU tar đều tạo được zip với -a. Trên Windows dùng bsdtar của hệ
-  // thống: tar của Git Bash hiểu "E:" là máy từ xa.
-  const tar = process.platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
-  execFileSync(tar, ['-a', '-c', '-f', `${name}.zip`, name], { cwd: join(root, 'release'), stdio: 'inherit' });
-  console.log(`Đã tạo ${zip}`);
-} catch {
-  console.log(`Không tạo được zip (thiếu tar); dùng thư mục ${out}`);
-}
-console.log(`Đã tạo ${out}`);
+// node_modules, runtime/node.exe, run.cmd, zip và (với --publish <dir>) phát hành lên farm: phần chung
+// với worker kia, nằm ở ag-farm/tools/worker-installer.
+const installer = join(root, '..', 'ag-farm', 'tools', 'worker-installer', 'package-release.mjs');
+const { finishRelease, publishDirFromArgv } = await import(pathToFileURL(installer).href);
+finishRelease({
+  repoRoot: root,
+  releaseRoot: join(root, 'release'),
+  name,
+  packageName: 'ag-scan-worker',
+  version: pkg.version,
+  publishDir: publishDirFromArgv(),
+});
