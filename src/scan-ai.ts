@@ -202,6 +202,50 @@ export interface ScanAiOptions {
 }
 
 /** Factory: tạo handler scan.ai với Ollama URL cụ thể. */
+/** A short title reads as a title (the schema allows 120; qwen2.5vl:3b tends to put a sentence there). */
+export const TITLE_MAX_CHARS = 80;
+/** Scripts the small Qwen-VL models slip into Vietnamese text now and then. */
+const FOREIGN_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const FOREIGN_SCRIPT_ALL = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu;
+
+type Description = NonNullable<AiManifest['description']>;
+
+/** Vietnamese text fields (every string field but `summary_en`), with their names. */
+function textFields(d: Description): [string, string][] {
+  const out: [string, string][] = [];
+  for (const [k, v] of Object.entries(d)) {
+    if (k === 'summary_en') continue;
+    if (typeof v === 'string') out.push([k, v]);
+    else if (Array.isArray(v)) v.forEach((x, i) => { if (typeof x === 'string') out.push([`${k}[${i}]`, x]); });
+  }
+  return out;
+}
+
+/** What makes a schema-valid description still unusable for Studio: foreign scripts, a sentence as the title. */
+export function descriptionProblems(d: Description): string[] {
+  const problems = textFields(d).filter(([, v]) => FOREIGN_SCRIPT.test(v)).map(([k]) => `${k} có chữ không phải tiếng Việt`);
+  if (d.title_vi.length > TITLE_MAX_CHARS) problems.push(`title_vi dài ${d.title_vi.length} ký tự`);
+  return problems;
+}
+
+/** Last resort after the repair round: drop foreign characters, cut the title at a word boundary. */
+export function cleanDescription(d: Description): Description {
+  const clean = (v: string) => v.replace(FOREIGN_SCRIPT_ALL, '').replace(/\s{2,}/g, ' ').trim();
+  const out = JSON.parse(JSON.stringify(d)) as Record<string, unknown>;
+  for (const [k, v] of Object.entries(out)) {
+    if (k === 'summary_en') continue;
+    if (typeof v === 'string') out[k] = clean(v);
+    else if (Array.isArray(v)) out[k] = v.map((x) => (typeof x === 'string' ? clean(x) : x)).filter((x) => x !== '');
+  }
+  let title = String(out['title_vi'] ?? '');
+  if (title.length > TITLE_MAX_CHARS) {
+    const cut = title.slice(0, TITLE_MAX_CHARS);
+    title = (cut.lastIndexOf(' ') > 40 ? cut.slice(0, cut.lastIndexOf(' ')) : cut).replace(/[\s,.;:]+$/, '');
+  }
+  out['title_vi'] = title || String(d.title_vi).slice(0, TITLE_MAX_CHARS);
+  return out as Description;
+}
+
 export function createScanAiHandler(options: ScanAiOptions = {}): (ctx: JobContext) => Promise<JobResult> {
   return (ctx) => runScanAi(ctx, options.ollamaUrl ?? DEFAULT_OLLAMA_URL);
 }
@@ -337,10 +381,21 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
       );
       const parsed = attemptJsonRepair(raw);
       const validated = AssetDescriptionSchema.safeParse(parsed);
-      if (validated.success) {
-        description = validated.data;
+      const problems = validated.success ? descriptionProblems(validated.data) : [];
+      if (validated.success && (problems.length === 0 || attempt === repair_attempts)) {
+        // Out of repair rounds: keep the description, cleaned, rather than fail a video over a stray character.
+        description = problems.length ? cleanDescription(validated.data) : validated.data;
+        if (problems.length) log.warn('Description kept after cleaning', { problems });
         lastError = null;
         break;
+      } else if (validated.success) {
+        lastError = `Description problems (attempt ${attempt}): ${problems.join('; ')}`;
+        log.warn(lastError);
+        summaryMessages.push({ role: 'assistant', content: raw });
+        summaryMessages.push({
+          role: 'user',
+          content: `Mô tả chưa đạt: ${problems.join('; ')}. Viết lại toàn bộ JSON, chỉ dùng tiếng Việt có dấu (summary_en bằng tiếng Anh), không dùng chữ Hán, Nhật hay Hàn; title_vi ngắn gọn, tối đa ${TITLE_MAX_CHARS} ký tự.`,
+        });
       } else {
         lastError = `Validation failed (attempt ${attempt}): ${validated.error.message}`;
         log.warn(lastError);

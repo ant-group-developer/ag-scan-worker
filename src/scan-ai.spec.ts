@@ -9,7 +9,7 @@ import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import sharp from 'sharp';
-import { createScanAiHandler, handleScanAi } from './scan-ai';
+import { cleanDescription, createScanAiHandler, descriptionProblems, handleScanAi, TITLE_MAX_CHARS } from './scan-ai';
 import type { JobContext } from '@ag-farm/worker-sdk';
 import { AiManifestSchema } from '@ag-farm/protocol';
 
@@ -319,6 +319,36 @@ describe('handleScanAi v2', () => {
     const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
     const manifest = AiManifestSchema.parse(JSON.parse(uploads.get('ai.json')!.toString()));
     expect(manifest.description).not.toBeNull();
+  });
+
+  it('asks again when the description slips into Chinese or uses a sentence as the title', async () => {
+    const mixed = JSON.stringify({
+      ...JSON.parse(VALID_DESCRIPTION),
+      title_vi: 'Một người phụ nữ mặc áo vàng đứng giữa hai đứa trẻ ngồi trên nền gạch trong khi đó một幼',
+      summary_vi: 'Trẻ em uống nước从 bình.',
+    });
+    const ollama = await createFakeOllama({ responses: [VALID_NOTE, mixed, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_lang');
+    mkdirSync(workDir, { recursive: true });
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, makePayload(4, 4, 1), new AbortController().signal);
+    await handleScanAi(ctx);
+    await ollama.close();
+    expect(ollama.callCount).toBe(3);
+    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
+    const manifest = AiManifestSchema.parse(JSON.parse(uploads.get('ai.json')!.toString()));
+    expect(manifest.description?.title_vi).toBe('Video thử nghiệm ngoài trời');
+  });
+
+  it('keeps a cleaned description when the repair round still has foreign characters', () => {
+    const d = { ...JSON.parse(VALID_DESCRIPTION), title_vi: 'Công viên 公园 buổi chiều', tags: ['công viên', '公园'] };
+    expect(descriptionProblems(d)).toEqual(['title_vi có chữ không phải tiếng Việt', 'tags[1] có chữ không phải tiếng Việt']);
+    const clean = cleanDescription(d);
+    expect(clean.title_vi).toBe('Công viên buổi chiều');
+    expect(clean.tags).toEqual(['công viên']);
+    expect(descriptionProblems(clean)).toEqual([]);
+    const long = cleanDescription({ ...d, title_vi: 'Cảnh '.repeat(40).trim() });
+    expect(long.title_vi.length).toBeLessThanOrEqual(TITLE_MAX_CHARS);
+    expect(long.title_vi.endsWith(' ')).toBe(false);
   });
 
   it('throws retryable error and writes ai.json with description=null when all attempts fail', async () => {

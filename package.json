@@ -1,6 +1,6 @@
 {
   "name": "@ag-farm/ag-scan-worker",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Worker quét footage (scan.extract, scan.ai) cho máy cấu hình cao",
   "main": "dist/main.js",
   "scripts": {
