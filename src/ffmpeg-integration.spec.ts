@@ -210,8 +210,16 @@ describe('ffmpeg-utils integration', () => {
       // color filter produces identical frames → frozen
       const path = await createTestVideo('static_test.mp4', 'color=c=blue:size=320x240:rate=25', 5);
       const metrics = await getTechMetrics(path, 0, 5, false, noopLog);
-      // frozen detection needs a few frames to trigger
-      expect(metrics.frozen_ratio).toBeGreaterThanOrEqual(0);
+      // a freeze counts once the picture has held for 1 s, so the first second is not in it
+      expect(metrics.frozen_ratio).toBeGreaterThan(0.7);
+    });
+
+    it('does not call moving footage frozen when frames repeat in pairs', async () => {
+      // 25 fps doubled to 50 fps: every frame equals the one before it, the picture still moves.
+      // Counting every near-identical pair as a freeze (d=0) summed these into a high frozen_ratio.
+      const path = await createTestVideo('doubled_test.mp4', 'testsrc2=size=320x240:rate=25,fps=50', 5);
+      const metrics = await getTechMetrics(path, 0, 5, false, noopLog);
+      expect(metrics.frozen_ratio).toBeLessThan(0.1);
     });
   });
 });

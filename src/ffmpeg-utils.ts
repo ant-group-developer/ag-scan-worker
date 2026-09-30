@@ -312,7 +312,9 @@ export async function getTechMetrics(
     'signalstats',
     'blurdetect=high=1',
     `blackdetect=d=0`,
-    `freezedetect=n=0.001:d=0`,
+    // d=1: a freeze counts only once the picture has held for 1 s. With d=0 every pair of near-identical
+    // frames starts one, and slow real footage (e.g. 4K 10-bit) chained them into ~100 % "frozen".
+    `freezedetect=n=0.001:d=1`,
   ].join(',');
 
   const audioFilters = hasAudio ? 'silencedetect=n=-50dB:d=0' : null;
