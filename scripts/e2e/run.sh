@@ -72,7 +72,7 @@ EOF
 JOB=$(curl -s -X POST localhost:3978/v1/owner/jobs -H "Authorization: Owner $OWNER_KEY" -H 'Content-Type: application/json' -d '{
   "type":"scan.extract","correlation_id":"e2e:extract",
   "payload":{"asset":{"id":"123e4567-e89b-42d3-a456-426614174777","kind":"video","mime_type":"video/mp4","size_bytes":null,"checksum_sha256":null,"duration_ms":10000,"width":640,"height":360},"extract_version":"e2e"}}')
-JOB_ID=$(node -e "console.log(JSON.parse(process.argv[1]).job.id)" "$JOB") || { echo "submit failed: $JOB"; exit 1; }
+JOB_ID=$(node -e "const b=JSON.parse(process.argv[1]);console.log((b.data??b).job.id)" "$JOB") || { echo "submit failed: $JOB"; exit 1; }
 echo "submitted $JOB_ID"
 
 # WORKER_RUN_DIR/WORKER_ENTRY: chạy bản phát hành (scripts/release.mjs) thay cho dist/ của repo
@@ -80,12 +80,12 @@ cd "${WORKER_RUN_DIR:-$WORKER}" && node "${WORKER_ENTRY:-dist/main.js}" --config
 
 STATUS=queued
 for i in $(seq 1 90); do
-  STATUS=$(curl -s localhost:3978/v1/owner/jobs/$JOB_ID -H "Authorization: Owner $OWNER_KEY" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);console.log(j.status+' '+JSON.stringify(j.result||j.error))})")
+  STATUS=$(curl -s localhost:3978/v1/owner/jobs/$JOB_ID -H "Authorization: Owner $OWNER_KEY" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const b=JSON.parse(s),j=b.data??b;console.log(j.status+' '+JSON.stringify(j.result||j.error))})")
   case "$STATUS" in completed*|failed*) break;; esac
   sleep 2
 done
 echo "job: $STATUS"
-echo "--- unacked list:"; curl -s "localhost:3978/v1/owner/jobs?status=completed,failed&unacked=1" -H "Authorization: Owner $OWNER_KEY" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);console.log(j.jobs.map(x=>x.id+' '+x.status))})"
+echo "--- unacked list:"; curl -s "localhost:3978/v1/owner/jobs?status=completed,failed&unacked=1" -H "Authorization: Owner $OWNER_KEY" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const b=JSON.parse(s),j=b.data??b;console.log(j.jobs.map(x=>x.id+' '+x.status))})"
 echo "--- stored files:"; (cd "$SP/store" && find . -type f | sort | head -20)
 if [ -f "$SP/store/extract.json" ]; then
   node -e "const m=require('$SP/store/extract.json');console.log('segments', m.segments.map(s=>[s.start_ms,s.end_ms,s.boundary_reason,s.keyframes.length]));console.log('proxy', m.proxy)"
