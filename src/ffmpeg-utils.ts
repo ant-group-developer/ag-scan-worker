@@ -342,10 +342,15 @@ export async function getTechMetrics(
 
   const ffmpeg = resolveFfmpeg();
 
-  // Video filters
+  // Video filters. signalstats and blurdetect only set per-frame metadata: the metadata filters print
+  // it to stderr (without them brightness and blur were always null, so a blurry video was never
+  // "dead"). Two frames a second are enough for whole-video averages and keep long videos fast.
   const vf = [
+    'fps=2',
     'signalstats',
-    'blurdetect=high=1',
+    'blurdetect',
+    'metadata=mode=print:key=lavfi.signalstats.YAVG',
+    'metadata=mode=print:key=lavfi.blur',
     `blackdetect=d=0`,
     // d=1: a freeze counts only once the picture has held for 1 s. With d=0 every pair of near-identical
     // frames starts one, and slow real footage (e.g. 4K 10-bit) chained them into ~100 % "frozen".
@@ -364,23 +369,24 @@ export async function getTechMetrics(
 
   let stderr = '';
   await runProcess(ffmpeg, args, {
-    timeoutMs: 60_000,
+    // One pass over the whole video: allow up to real time, at least a minute
+    timeoutMs: Math.max(60_000, duration * 1000),
     onStderrLine: (line) => { stderr += line + '\n'; },
   });
 
-  // Parse signalstats YAVG
+  // Mean of the printed signalstats YAVG (0-255)
   let totalYavg = 0;
   let yavgCount = 0;
-  for (const m of stderr.matchAll(/YAVG:([0-9.]+)/g)) {
+  for (const m of stderr.matchAll(/lavfi\.signalstats\.YAVG=([0-9.]+)/g)) {
     totalYavg += parseFloat(m[1] ?? '0');
     yavgCount++;
   }
   const brightness = yavgCount > 0 ? (totalYavg / yavgCount) / 255 : null;
 
-  // Parse blurdetect
+  // Mean of the printed blurdetect score (frames with `nan`, e.g. flat colour, are skipped)
   let totalBlur = 0;
   let blurCount = 0;
-  for (const m of stderr.matchAll(/blur:([0-9.]+)/gi)) {
+  for (const m of stderr.matchAll(/lavfi\.blur=([0-9.]+)/g)) {
     totalBlur += parseFloat(m[1] ?? '0');
     blurCount++;
   }

@@ -214,6 +214,21 @@ describe('ffmpeg-utils integration', () => {
       expect(metrics.frozen_ratio).toBeGreaterThan(0.7);
     });
 
+    it('measures brightness and blur (a blurred clip scores blurrier than a sharp one)', async () => {
+      const sharp = await createTestVideo('sharp_test.mp4', 'testsrc2=size=640x360:rate=25', 3);
+      const blurred = await createTestVideo('blurred_test.mp4', 'testsrc2=size=640x360:rate=25,gblur=sigma=8', 3);
+      const white = await createTestVideo('white_test.mp4', 'color=white:size=320x240:rate=25', 3);
+      const s = await getTechMetrics(sharp, 0, 3, false, noopLog);
+      const b = await getTechMetrics(blurred, 0, 3, false, noopLog);
+      const w = await getTechMetrics(white, 0, 3, false, noopLog);
+      // Both used to be null: the filters only set frame metadata, nothing was printed to parse.
+      expect(s.brightness).not.toBeNull();
+      expect(w.brightness).toBeGreaterThan(0.9);
+      expect(s.blur).not.toBeNull();
+      expect(b.blur!).toBeGreaterThan(s.blur! * 2);
+      expect(b.blur!).toBeGreaterThanOrEqual(12); // the default `dead.blur_min`
+    });
+
     it('does not call moving footage frozen when frames repeat in pairs', async () => {
       // 25 fps doubled to 50 fps: every frame equals the one before it, the picture still moves.
       // Counting every near-identical pair as a freeze (d=0) summed these into a high frozen_ratio.

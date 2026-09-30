@@ -288,7 +288,8 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
       note = `(nhóm ${gi + 1}: không đọc được)`;
     }
 
-    notes.push(note.trim());
+    // AiManifest caps each note at 2000 characters; a chatty model must not fail the whole job
+    notes.push(note.trim().slice(0, 2000));
     log.info(`Note group ${gi + 1}/${totalGroups}`, { length: note.length });
   }
 
@@ -370,7 +371,7 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
     prompt_version,
     description,
     notes,
-    error: lastError,
+    error: lastError === null ? null : lastError.slice(0, 2000),
     duration_ms,
   };
 
