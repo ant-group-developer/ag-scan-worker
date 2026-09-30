@@ -220,6 +220,8 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
   // Tải file gốc
   const sourceLocalPath = join(workDir, 'source_original');
   await ctx.download('source', sourceLocalPath);
+  // Việc Studio trên máy được ưu tiên: nhường slot trước mỗi bước nặng.
+  await ctx.yieldToInteractive();
   ctx.progress(15, 'probe');
 
   // ffprobe
@@ -260,6 +262,7 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
   }
 
   // Dò cảnh trên proxy (hoặc source)
+  await ctx.yieldToInteractive();
   ctx.progress(40, 'scene_detect');
   const analyzeSource = proxyInfo ? proxyPath : sourceLocalPath;
   const sceneStartMs = proxyInfo ? 0 : start_time_ms;
@@ -305,6 +308,7 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
   });
 
   log.info(`Built ${segments.length} segments`);
+  await ctx.yieldToInteractive();
   ctx.progress(50, 'keyframes');
 
   // Trích keyframe + tech metrics
@@ -313,6 +317,7 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
   const allKeyframePaths: string[] = [];
 
   for (let si = 0; si < segments.length; si++) {
+    await ctx.yieldToInteractive();
     const seg = segments[si]!;
     const segDuration = seg.end_ms - seg.start_ms;
     const segStartSec = seg.start_ms / 1000;

@@ -156,7 +156,25 @@ Trả lời CHÍNH XÁC theo JSON schema, không thêm bất kỳ văn bản nà
 
 // ---- Handler chính ----
 
+export interface ScanAiOptions {
+  /** Địa chỉ Ollama (`extra.ollama_url` trong config), mặc định máy này. */
+  ollamaUrl?: string;
+}
+
+/** Handler `scan.ai` dùng Ollama ở `options.ollamaUrl`. */
+export function createScanAiHandler(options: ScanAiOptions = {}): (ctx: JobContext) => Promise<JobResult> {
+  return (ctx) => runScanAi(ctx, options.ollamaUrl ?? DEFAULT_OLLAMA_URL);
+}
+
+/** Handler `scan.ai` với Ollama trên máy này (giữ cho code và test cũ). */
 export async function handleScanAi(ctx: JobContext): Promise<JobResult> {
+  const ollamaUrlOverride = (ctx as unknown as { ollamaUrl?: string }).ollamaUrl;
+  return runScanAi(ctx, ollamaUrlOverride ?? DEFAULT_OLLAMA_URL);
+}
+
+const DEFAULT_OLLAMA_URL = 'http://localhost:11434';
+
+async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult> {
   const payloadResult = ScanAiPayloadSchema.safeParse(ctx.payload);
   if (!payloadResult.success) {
     throw new NonRetryableError('invalid_payload', `Invalid scan.ai payload: ${payloadResult.error.message}`);
@@ -166,8 +184,6 @@ export async function handleScanAi(ctx: JobContext): Promise<JobResult> {
   const log = ctx.log.child({ handler: 'scan.ai', asset_id, chunk });
   log.info('Starting scan.ai', { model, segments: segments.length });
 
-  // Ollama URL từ config nếu có, mặc định localhost
-  const ollamaUrl = (ctx as unknown as { ollamaUrl?: string }).ollamaUrl ?? 'http://localhost:11434';
   const jsonSchema = getSegmentJsonSchema();
   const systemPrompt = buildSystemPrompt(context);
   const { keep_alive, repair_attempts } = options;
@@ -179,6 +195,8 @@ export async function handleScanAi(ctx: JobContext): Promise<JobResult> {
   const total = segments.length;
 
   for (let i = 0; i < segments.length; i++) {
+    // Việc Studio trên máy được ưu tiên: nhả GPU giữa các đoạn khi có job interactive.
+    await ctx.yieldToInteractive();
     const seg = segments[i]!;
     const t0 = Date.now();
     ctx.progress(Math.round((i / total) * 95), `segment_${seg.index}`);

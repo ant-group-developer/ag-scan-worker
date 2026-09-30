@@ -179,7 +179,9 @@ function buildFakeContext(
       child: () => ctx.log,
     },
     signal,
-    progress: (_percent: number, _stage?: string) => {},
+    progress: (_percent?: number, _stage?: string) => {},
+    shouldYield: () => false,
+    yieldToInteractive: async () => {},
 
     async download(inputName: string, dest: string) {
       // For 'source', copy the test video

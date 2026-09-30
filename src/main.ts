@@ -2,9 +2,10 @@
  * Điểm vào chính cho ag-scan-worker.
  * Dùng: ag-scan-worker --config <đường dẫn YAML>
  */
+import { constants as osConstants, setPriority } from 'node:os';
 import { runWorker, loadConfig } from '@ag-farm/worker-sdk';
 import { handleScanExtract } from './scan-extract';
-import { handleScanAi } from './scan-ai';
+import { createScanAiHandler } from './scan-ai';
 
 // ---- Parse args ----
 
@@ -31,12 +32,23 @@ async function main(): Promise<void> {
 
   console.log(`ag-scan-worker v${version} khởi động với config: ${configPath}`);
 
+  // Quét là việc nền: chạy dưới mức ưu tiên thường để render trên cùng máy không bị giành CPU.
+  // ffmpeg con thừa hưởng mức này (Windows: BELOW_NORMAL_PRIORITY_CLASS).
+  try {
+    setPriority(osConstants.priority.PRIORITY_BELOW_NORMAL);
+  } catch (err) {
+    console.warn('Không hạ được mức ưu tiên tiến trình:', err);
+  }
+
+  const extra = config.extra ?? {};
+  const ollamaUrl = typeof extra['ollama_url'] === 'string' ? extra['ollama_url'] : undefined;
+
   await runWorker({
     config,
     version,
     handlers: {
       'scan.extract': handleScanExtract,
-      'scan.ai': handleScanAi,
+      'scan.ai': createScanAiHandler({ ollamaUrl }),
     },
   });
 }

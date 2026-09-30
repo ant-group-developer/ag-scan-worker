@@ -77,6 +77,8 @@ async function runExtract(
     log,
     signal: new AbortController().signal,
     progress: () => {},
+    shouldYield: () => false,
+    yieldToInteractive: async () => {},
     async download(inputName: string, dest: string) {
       if (inputName !== 'source') throw new Error(`unexpected input ${inputName}`);
       copyFileSync(sourcePath, dest);

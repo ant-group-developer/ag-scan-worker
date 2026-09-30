@@ -7,7 +7,7 @@ import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import sharp from 'sharp';
-import { handleScanAi } from './scan-ai';
+import { createScanAiHandler, handleScanAi } from './scan-ai';
 import type { JobContext } from '@ag-farm/worker-sdk';
 import type { AiManifest } from '@ag-farm/protocol';
 import { AiManifestSchema } from '@ag-farm/protocol';
@@ -139,7 +139,9 @@ function buildFakeAiContext(
       child: () => ctx.log,
     },
     signal,
-    progress: (_percent: number, _stage?: string) => {},
+    progress: (_percent?: number, _stage?: string) => {},
+    shouldYield: () => false,
+    yieldToInteractive: async () => {},
 
     async download(inputName: string, dest: string) {
       // inputName like 'artifact:keyframes/0001-1.jpg'
@@ -247,6 +249,63 @@ describe('handleScanAi', () => {
       expect(parsed.data.items[0]!.description).not.toBeNull();
       expect(parsed.data.items[0]!.error).toBeNull();
     }
+  });
+
+  it('calls the Ollama given in extra.ollama_url, not localhost', async () => {
+    const ollama = await createFakeOllama({ responses: [VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_ai_url');
+    mkdirSync(workDir, { recursive: true });
+    const payload = {
+      asset_id: '123e4567-e89b-42d3-a456-426614174004',
+      chunk: 0,
+      model: 'qwen2.5vl:7b',
+      prompt_version: 'v1',
+      context: { project_names: [], category_names: [], province_names: [] },
+      segments: [
+        {
+          segment_id: '123e4567-e89b-42d3-a456-426614174005',
+          index: 0,
+          start_ms: 0,
+          end_ms: 5000,
+          keyframes: ['artifact:keyframes/kf0.jpg'],
+        },
+      ],
+      options: { keep_alive: '2m', repair_attempts: 0 },
+    };
+    // Context không mang ollamaUrl: chỉ tuỳ chọn của handler chỉ tới Ollama giả
+    const ctx = buildFakeAiContext(workDir, 'http://127.0.0.1:1', kfDir, payload, new AbortController().signal);
+    const result = await createScanAiHandler({ ollamaUrl: ollama.url })(ctx);
+    await ollama.close();
+    expect(result.summary).toMatchObject({ success: 1 });
+    expect(ollama.lastImages).toHaveLength(1);
+  });
+
+  it('gives its slot back between segments when Studio work waits', async () => {
+    const ollama = await createFakeOllama({ responses: [VALID_DESCRIPTION, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_ai_yield');
+    mkdirSync(workDir, { recursive: true });
+    const segment = (n: number) => ({
+      segment_id: `123e4567-e89b-42d3-a456-42661417400${n}`,
+      index: n,
+      start_ms: n * 5000,
+      end_ms: n * 5000 + 5000,
+      keyframes: ['artifact:keyframes/kf0.jpg'],
+    });
+    const payload = {
+      asset_id: '123e4567-e89b-42d3-a456-426614174004',
+      chunk: 0,
+      model: 'qwen2.5vl:7b',
+      prompt_version: 'v1',
+      context: { project_names: [], category_names: [], province_names: [] },
+      segments: [segment(5), segment(6)],
+      options: { keep_alive: '2m', repair_attempts: 0 },
+    };
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
+    let yields = 0;
+    ctx.yieldToInteractive = async () => { yields++; };
+    await handleScanAi(ctx);
+    await ollama.close();
+    expect(yields).toBe(2);
   });
 
   it('repairs invalid JSON on second attempt', async () => {
