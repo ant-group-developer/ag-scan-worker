@@ -6,8 +6,10 @@
  * Bước 2 – Tóm tắt (summary): dùng tất cả ghi chú + tối đa 4 keyframe đại diện +
  *   gợi ý ngữ cảnh → một AssetDescription JSON cho cả video.
  *
- * Kết quả: ai.json (AiManifestSchema v2). Nếu mô tả thất bại sau mọi lần sửa,
- * ghi description=null và ném lỗi retryable để farm thử lại.
+ * Kết quả: ai.json (AiManifestSchema v2) và ai-trace.json (AiTraceSchema) ghi lại
+ * mọi lần gọi Ollama để dùng làm dataset huấn luyện. Trace upload là best-effort:
+ * lỗi 403 từ ag-go cũ không làm fail job.
+ * Nếu mô tả thất bại sau mọi lần sửa, ghi description=null và ném lỗi retryable.
  */
 import { z } from 'zod';
 import {
@@ -16,8 +18,11 @@ import {
   AiManifestSchema,
   AI_MANIFEST_SCHEMA,
   AI_MANIFEST_PATH,
+  AiTraceSchema,
+  AI_TRACE_SCHEMA,
+  AI_TRACE_PATH,
 } from '@ag-farm/protocol';
-import type { AiManifest } from '@ag-farm/protocol';
+import type { AiManifest, AiTrace } from '@ag-farm/protocol';
 import type { JobResult } from '@ag-farm/protocol';
 import type { JobContext } from '@ag-farm/worker-sdk';
 import { NonRetryableError } from '@ag-farm/worker-sdk';
@@ -82,6 +87,20 @@ interface OllamaMessage {
 
 interface OllamaResponse {
   message?: { content?: string };
+  done_reason?: string;
+  prompt_eval_count?: number;
+  eval_count?: number;
+  /** Thời gian xử lý tổng (nanoseconds). */
+  total_duration?: number;
+}
+
+/** Kết quả đầy đủ từ một lần gọi Ollama, bao gồm các chỉ số inference cho trace. */
+interface OllamaCallResult {
+  content: string;
+  done_reason: string | null;
+  prompt_eval_count: number | null;
+  eval_count: number | null;
+  total_duration_ms: number | null;
 }
 
 async function callOllama(
@@ -94,7 +113,7 @@ async function callOllama(
     format?: object;
     numPredict?: number;
   } = {},
-): Promise<string> {
+): Promise<OllamaCallResult> {
   const body: Record<string, unknown> = {
     model,
     messages,
@@ -119,7 +138,37 @@ async function callOllama(
   }
 
   const data = (await res.json()) as OllamaResponse;
-  return data.message?.content ?? '';
+  return {
+    content: data.message?.content ?? '',
+    done_reason: data.done_reason ?? null,
+    prompt_eval_count: data.prompt_eval_count != null ? data.prompt_eval_count : null,
+    eval_count: data.eval_count != null ? data.eval_count : null,
+    total_duration_ms: data.total_duration != null ? data.total_duration / 1_000_000 : null,
+  };
+}
+
+// ---- Kiểu trace message (không có base64) ----
+
+interface TraceMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+  images: Array<{ input: string; t_ms: number }>;
+}
+
+interface TraceCall {
+  step: 'notes' | 'summary';
+  group: number | null;
+  attempt: number;
+  started_at: string;
+  messages: TraceMessage[];
+  options: Record<string, unknown>;
+  response: string | null;
+  error: string | null;
+  accepted: boolean;
+  done_reason: string | null;
+  prompt_eval_count: number | null;
+  eval_count: number | null;
+  total_duration_ms: number | null;
 }
 
 // ---- Sửa JSON ----
@@ -274,6 +323,9 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
 
   const t0 = Date.now();
 
+  /** Danh sách các lần gọi Ollama, dùng để build AiTrace sau. */
+  const traceCalls: TraceCall[] = [];
+
   // Tải tất cả keyframes về local
   const localPaths: string[] = [];
   for (let i = 0; i < keyframes.length; i++) {
@@ -286,6 +338,13 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
       log.warn(`Failed to download keyframe ${kf.input}`, { error: String(e) });
       localPaths.push('');
     }
+  }
+
+  /** Map từ local path → { input, t_ms } để build trace images mà không dùng base64. */
+  const pathToKfRef = new Map<string, { input: string; t_ms: number }>();
+  for (let i = 0; i < keyframes.length; i++) {
+    const lp = localPaths[i] ?? '';
+    if (lp) pathToKfRef.set(lp, { input: keyframes[i]!.input, t_ms: keyframes[i]!.t_ms });
   }
 
   // ---- Bước 1: Ghi chú từng nhóm keyframe ----
@@ -306,12 +365,16 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
 
     const start = gi * frames_per_note;
     const end = Math.min(start + frames_per_note, keyframes.length);
-    const groupPaths = localPaths.slice(start, end).filter((p) => p !== '');
 
+    const traceImagesForGroup: Array<{ input: string; t_ms: number }> = [];
     const images: string[] = [];
-    for (const lp of groupPaths) {
+
+    for (let ji = start; ji < end; ji++) {
+      const lp = localPaths[ji] ?? '';
+      if (!lp) continue;
       try {
         images.push(await imageToBase64(lp));
+        traceImagesForGroup.push({ input: keyframes[ji]!.input, t_ms: keyframes[ji]!.t_ms });
       } catch (e) {
         log.warn('Failed to encode keyframe', { error: String(e) });
       }
@@ -320,24 +383,53 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
     const tStart = keyframes[start]?.t_ms ?? 0;
     const tEnd = keyframes[Math.min(end - 1, keyframes.length - 1)]?.t_ms ?? 0;
 
+    const userContent = `Nhóm keyframe ${gi + 1}/${totalGroups} (t=${tStart}ms–${tEnd}ms, ${images.length} ảnh). Hãy mô tả ngắn gọn bằng tiếng Việt.`;
     const messages: OllamaMessage[] = [
       { role: 'system', content: notesSystemPrompt },
       {
         role: 'user',
-        content: `Nhóm keyframe ${gi + 1}/${totalGroups} (t=${tStart}ms–${tEnd}ms, ${images.length} ảnh). Hãy mô tả ngắn gọn bằng tiếng Việt.`,
+        content: userContent,
         images: images.length > 0 ? images : undefined,
       },
     ];
 
+    const traceMessages: TraceMessage[] = [
+      { role: 'system', content: notesSystemPrompt, images: [] },
+      { role: 'user', content: userContent, images: traceImagesForGroup },
+    ];
+
+    const traceOptions: Record<string, unknown> = { temperature: 0, num_predict: 1024, keep_alive };
+    const callStartedAt = new Date().toISOString();
+
     let note = '';
+    let callResult: OllamaCallResult | null = null;
+    let callError: string | null = null;
     try {
-      note = await callOllama(ollamaUrl, model, messages, keep_alive, ctx.signal, { numPredict: 1024 });
+      callResult = await callOllama(ollamaUrl, model, messages, keep_alive, ctx.signal, { numPredict: 1024 });
+      note = callResult.content;
     } catch (e) {
-      lastNotesError = String(e);
+      callError = String(e);
+      lastNotesError = callError;
       failedGroups++;
-      log.warn(`Notes call failed for group ${gi}`, { error: lastNotesError });
+      log.warn(`Notes call failed for group ${gi}`, { error: callError });
       note = `(nhóm ${gi + 1}: không đọc được)`;
     }
+
+    traceCalls.push({
+      step: 'notes',
+      group: gi,
+      attempt: 1,
+      started_at: callStartedAt,
+      messages: traceMessages,
+      options: traceOptions,
+      response: callResult !== null ? callResult.content : null,
+      error: callError,
+      accepted: callError === null,
+      done_reason: callResult?.done_reason ?? null,
+      prompt_eval_count: callResult?.prompt_eval_count ?? null,
+      eval_count: callResult?.eval_count ?? null,
+      total_duration_ms: callResult?.total_duration_ms ?? null,
+    });
 
     // AiManifest caps each note at 2000 characters; a chatty model must not fail the whole job
     notes.push(note.trim().slice(0, 2000));
@@ -346,11 +438,10 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
 
   log.info('Notes step done', { groups: notes.length, failedGroups, totalFrames });
 
-  // Không nhóm nào đọc được (Ollama chết, model chưa nạp, không tải được keyframe nào): tóm tắt
-  // lúc này chỉ bịa ra mô tả từ các dòng "không đọc được" → ghi lỗi vào ai.json và để farm thử lại.
+  // Không nhóm nào đọc được → ghi lỗi vào ai.json, upload trace, để farm thử lại.
   if (failedGroups > 0 && failedGroups === notes.length) {
     const error = `scan.ai: every notes call failed (${failedGroups} group(s)): ${lastNotesError ?? 'unknown'}`;
-    await ctx.uploadJson(AI_MANIFEST_PATH, AiManifestSchema.parse({
+    const manifest = AiManifestSchema.parse({
       schema: AI_MANIFEST_SCHEMA,
       asset_id,
       model,
@@ -359,7 +450,9 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
       notes,
       error: error.slice(0, 2000),
       duration_ms: Date.now() - t0,
-    } satisfies AiManifest));
+    } satisfies AiManifest);
+    await tryUploadTrace(ctx, log, traceCalls, asset_id, model, prompt_version);
+    await ctx.uploadJson(AI_MANIFEST_PATH, manifest);
     throw new Error(error);
   }
 
@@ -372,7 +465,8 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
   const summarySystemPrompt = buildSummarySystemPrompt(context, media);
 
   // Chọn tối đa 4 keyframe đại diện rải đều
-  const summaryFramePaths = pickEvenly(localPaths.filter((p) => p !== ''), 4);
+  const validPaths = localPaths.filter((p) => p !== '');
+  const summaryFramePaths = pickEvenly(validPaths, 4);
   const summaryImages: string[] = [];
   for (const lp of summaryFramePaths) {
     try {
@@ -380,16 +474,27 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
     } catch { /**/ }
   }
 
+  // Trace images cho bước summary (input refs, không base64)
+  const summaryTraceImages = summaryFramePaths.map(
+    (lp) => pathToKfRef.get(lp) ?? { input: lp, t_ms: 0 },
+  );
+
   const notesText = notes.map((n, i) => `Nhóm ${i + 1}: ${n}`).join('\n');
-  const userContent = `Dưới đây là ghi chú các nhóm keyframe của video:\n\n${notesText}\n\nHãy viết mô tả tổng hợp cho cả video theo JSON schema.`;
+  const summaryUserContent = `Dưới đây là ghi chú các nhóm keyframe của video:\n\n${notesText}\n\nHãy viết mô tả tổng hợp cho cả video theo JSON schema.`;
 
   const summaryMessages: OllamaMessage[] = [
     { role: 'system', content: summarySystemPrompt },
     {
       role: 'user',
-      content: userContent,
+      content: summaryUserContent,
       images: summaryImages.length > 0 ? summaryImages : undefined,
     },
+  ];
+
+  /** Trace messages song song với summaryMessages (không có base64). */
+  const summaryTraceMessages: TraceMessage[] = [
+    { role: 'system', content: summarySystemPrompt, images: [] },
+    { role: 'user', content: summaryUserContent, images: summaryTraceImages },
   ];
 
   let description: AiManifest['description'] = null;
@@ -398,11 +503,27 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
   for (let attempt = 0; attempt <= repair_attempts; attempt++) {
     await ctx.yieldToInteractive();
 
+    const traceOptions: Record<string, unknown> = {
+      temperature: 0,
+      num_predict: 1536,
+      keep_alive,
+      format: jsonSchema,
+    };
+    const callStartedAt = new Date().toISOString();
+    // Snapshot các trace messages tại thời điểm gọi (trước khi repair thêm vào)
+    const snapshotTraceMessages: TraceMessage[] = summaryTraceMessages.map((m) => ({ ...m, images: [...m.images] }));
+
+    let raw = '';
+    let summaryCallResult: OllamaCallResult | null = null;
+    let summaryCallError: string | null = null;
+    let accepted = false;
+
     try {
-      const raw = await callOllama(
+      summaryCallResult = await callOllama(
         ollamaUrl, model, summaryMessages, keep_alive, ctx.signal,
         { format: jsonSchema, numPredict: 1536 },
       );
+      raw = summaryCallResult.content;
       const parsed = attemptJsonRepair(raw);
       const validated = AssetDescriptionSchema.safeParse(parsed);
       const problems = validated.success ? descriptionProblems(validated.data) : [];
@@ -411,7 +532,7 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
         description = problems.length ? cleanDescription(validated.data) : validated.data;
         if (problems.length) log.warn('Description kept after cleaning', { problems });
         lastError = null;
-        break;
+        accepted = true;
       } else if (validated.success) {
         lastError = `Description problems (attempt ${attempt}): ${problems.join('; ')}`;
         log.warn(lastError);
@@ -419,6 +540,12 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
         summaryMessages.push({
           role: 'user',
           content: `Mô tả chưa đạt: ${problems.join('; ')}. Viết lại toàn bộ JSON, chỉ dùng tiếng Việt có dấu (summary_en bằng tiếng Anh), không dùng chữ Hán, Nhật hay Hàn; title_vi ngắn gọn, tối đa ${TITLE_MAX_CHARS} ký tự.`,
+        });
+        summaryTraceMessages.push({ role: 'assistant', content: raw, images: [] });
+        summaryTraceMessages.push({
+          role: 'user',
+          content: `Mô tả chưa đạt: ${problems.join('; ')}. Viết lại toàn bộ JSON, chỉ dùng tiếng Việt có dấu (summary_en bằng tiếng Anh), không dùng chữ Hán, Nhật hay Hàn; title_vi ngắn gọn, tối đa ${TITLE_MAX_CHARS} ký tự.`,
+          images: [],
         });
       } else {
         lastError = `Validation failed (attempt ${attempt}): ${validated.error.message}`;
@@ -431,13 +558,46 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
             role: 'user',
             content: `JSON không hợp lệ. Lỗi: ${validated.error.message}. Hãy sửa và trả lại JSON đúng schema.`,
           });
+          summaryTraceMessages.push({ role: 'assistant', content: raw, images: [] });
+          summaryTraceMessages.push({
+            role: 'user',
+            content: `JSON không hợp lệ. Lỗi: ${validated.error.message}. Hãy sửa và trả lại JSON đúng schema.`,
+            images: [],
+          });
         }
       }
     } catch (e) {
-      lastError = String(e);
-      log.warn(`Summary Ollama call failed (attempt ${attempt})`, { error: lastError });
-      if (ctx.signal.aborted) break;
+      summaryCallError = String(e);
+      lastError = summaryCallError;
+      log.warn(`Summary Ollama call failed (attempt ${attempt})`, { error: summaryCallError });
+      if (ctx.signal.aborted) {
+        traceCalls.push({
+          step: 'summary', group: null, attempt: attempt + 1,
+          started_at: callStartedAt, messages: snapshotTraceMessages, options: traceOptions,
+          response: null, error: summaryCallError, accepted: false,
+          done_reason: null, prompt_eval_count: null, eval_count: null, total_duration_ms: null,
+        });
+        break;
+      }
     }
+
+    traceCalls.push({
+      step: 'summary',
+      group: null,
+      attempt: attempt + 1,
+      started_at: callStartedAt,
+      messages: snapshotTraceMessages,
+      options: traceOptions,
+      response: summaryCallResult !== null ? raw : null,
+      error: summaryCallError,
+      accepted,
+      done_reason: summaryCallResult?.done_reason ?? null,
+      prompt_eval_count: summaryCallResult?.prompt_eval_count ?? null,
+      eval_count: summaryCallResult?.eval_count ?? null,
+      total_duration_ms: summaryCallResult?.total_duration_ms ?? null,
+    });
+
+    if (accepted) break;
   }
 
   const duration_ms = Date.now() - t0;
@@ -456,6 +616,9 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
 
   const validated = AiManifestSchema.parse(aiManifest);
   ctx.progress(98, 'upload_manifest');
+
+  // Upload trace trước ai.json (best-effort: 403 từ ag-go cũ không làm fail job)
+  await tryUploadTrace(ctx, log, traceCalls, asset_id, model, prompt_version);
   await ctx.uploadJson(AI_MANIFEST_PATH, validated);
 
   log.info('scan.ai done', {
@@ -477,4 +640,27 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
       duration_ms,
     },
   };
+}
+
+/** Upload ai-trace.json – best-effort: lỗi không làm fail job. */
+async function tryUploadTrace(
+  ctx: JobContext,
+  log: JobContext['log'],
+  calls: TraceCall[],
+  asset_id: string,
+  model: string,
+  prompt_version: string,
+): Promise<void> {
+  try {
+    const trace: AiTrace = AiTraceSchema.parse({
+      schema: AI_TRACE_SCHEMA,
+      asset_id,
+      model,
+      prompt_version,
+      calls,
+    });
+    await ctx.uploadJson(AI_TRACE_PATH, trace);
+  } catch (e) {
+    log.warn('Failed to upload ai-trace.json (best-effort, continuing)', { error: String(e) });
+  }
 }

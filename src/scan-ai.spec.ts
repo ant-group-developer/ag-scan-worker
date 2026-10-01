@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import sharp from 'sharp';
 import { cleanDescription, createScanAiHandler, descriptionProblems, handleScanAi, TITLE_MAX_CHARS } from './scan-ai';
 import type { JobContext } from '@ag-farm/worker-sdk';
-import { AiManifestSchema } from '@ag-farm/protocol';
+import { AiManifestSchema, AiTraceSchema } from '@ag-farm/protocol';
 
 jest.setTimeout(60_000);
 
@@ -456,5 +456,115 @@ describe('handleScanAi v2', () => {
     await ollama.close();
 
     expect(ollama.callCount).toBeGreaterThanOrEqual(2); // at least note + summary
+  });
+
+  // ---- Trace tests ----
+
+  it('uploads ai-trace.json with correct call count and accepted flags', async () => {
+    // 8 frames, frames_per_note=4 → 2 note calls (accepted) + 1 summary call (accepted) = 3 calls
+    const ollama = await createFakeOllama({ responses: [VALID_NOTE, VALID_NOTE, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_trace_calls');
+    mkdirSync(workDir, { recursive: true });
+
+    const payload = makePayload(8, 4, 1);
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
+
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
+    await ollama.close();
+
+    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
+    const traceBuf = uploads.get('ai-trace.json');
+    expect(traceBuf).toBeDefined();
+
+    const parsed = AiTraceSchema.safeParse(JSON.parse(traceBuf!.toString()));
+    if (!parsed.success) console.error('AiTrace invalid:', parsed.error.message);
+    expect(parsed.success).toBe(true);
+
+    if (parsed.success) {
+      expect(parsed.data.calls).toHaveLength(3);
+      // Both note calls accepted
+      expect(parsed.data.calls[0]!.step).toBe('notes');
+      expect(parsed.data.calls[0]!.group).toBe(0);
+      expect(parsed.data.calls[0]!.accepted).toBe(true);
+      expect(parsed.data.calls[1]!.step).toBe('notes');
+      expect(parsed.data.calls[1]!.group).toBe(1);
+      expect(parsed.data.calls[1]!.accepted).toBe(true);
+      // Summary call accepted
+      expect(parsed.data.calls[2]!.step).toBe('summary');
+      expect(parsed.data.calls[2]!.group).toBeNull();
+      expect(parsed.data.calls[2]!.accepted).toBe(true);
+    }
+  });
+
+  it('trace has no base64 in message images', async () => {
+    // 4 frames, frames_per_note=4 → 1 note + 1 summary
+    const ollama = await createFakeOllama({ responses: [VALID_NOTE, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_trace_no_b64');
+    mkdirSync(workDir, { recursive: true });
+
+    const payload = makePayload(4, 4, 0);
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
+
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
+    await ollama.close();
+
+    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
+    const trace = AiTraceSchema.parse(JSON.parse(uploads.get('ai-trace.json')!.toString()));
+
+    for (const call of trace.calls) {
+      for (const msg of call.messages) {
+        for (const img of msg.images) {
+          // Must be an input name, never a base64 string
+          expect(img.input.startsWith('artifact:')).toBe(true);
+          // A base64 JPEG would be many hundreds of chars; input names are short
+          expect(img.input.length).toBeLessThan(200);
+        }
+      }
+    }
+  });
+
+  it('repair attempts: only the accepted summary call has accepted=true', async () => {
+    // 1 note + bad summary + good summary (repair_attempts=1)
+    const ollama = await createFakeOllama({ responses: [VALID_NOTE, 'not-json', VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_trace_repair');
+    mkdirSync(workDir, { recursive: true });
+
+    const payload = makePayload(4, 4, 1);
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
+
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
+    await ollama.close();
+
+    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
+    const trace = AiTraceSchema.parse(JSON.parse(uploads.get('ai-trace.json')!.toString()));
+
+    // 1 note + 2 summary calls (attempt 1 bad, attempt 2 good)
+    expect(trace.calls).toHaveLength(3);
+    expect(trace.calls[1]!.accepted).toBe(false); // first summary: bad JSON
+    expect(trace.calls[2]!.accepted).toBe(true);  // second summary: accepted
+  });
+
+  it('failing trace upload does not fail the job', async () => {
+    const ollama = await createFakeOllama({ responses: [VALID_NOTE, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_trace_upload_fail');
+    mkdirSync(workDir, { recursive: true });
+
+    const payload = makePayload(4, 4, 0);
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, payload, new AbortController().signal);
+
+    // Make uploadJson throw for ai-trace.json (simulates ag-go returning 403)
+    const originalUploadJson = ctx.uploadJson.bind(ctx);
+    ctx.uploadJson = async (outputPath: string, data: unknown) => {
+      if (outputPath === 'ai-trace.json') throw new Error('403 Forbidden: trace not allowed');
+      return originalUploadJson(outputPath, data);
+    };
+
+    // The job must succeed despite the trace upload failure
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
+    await ollama.close();
+
+    // ai.json should still be written
+    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
+    expect(uploads.has('ai.json')).toBe(true);
   });
 });
