@@ -376,6 +376,49 @@ describe('handleScanAi v2', () => {
     expect(manifest.error).not.toBeNull();
   });
 
+  it('fails (retryable) without a summary call when every notes group fails', async () => {
+    // 8 frames, 4 per note → 2 note calls, both HTTP 500; the summary must not be asked to invent a description
+    const ollama = await createFakeOllama({ responses: [null, null, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_notes_fail');
+    mkdirSync(workDir, { recursive: true });
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, makePayload(8, 4, 1), new AbortController().signal);
+
+    await expect(handleScanAi(ctx)).rejects.toThrow(/every notes call failed \(2 group/);
+    await ollama.close();
+    expect(ollama.callCount).toBe(2);
+
+    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
+    const manifest = AiManifestSchema.parse(JSON.parse(uploads.get('ai.json')!.toString()));
+    expect(manifest.description).toBeNull();
+    expect(manifest.error).toMatch(/every notes call failed/);
+  });
+
+  it('still describes the video when only some notes groups fail', async () => {
+    const ollama = await createFakeOllama({ responses: [null, VALID_NOTE, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_notes_partial');
+    mkdirSync(workDir, { recursive: true });
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, makePayload(8, 4, 1), new AbortController().signal);
+
+    await expect(handleScanAi(ctx)).resolves.toBeDefined();
+    await ollama.close();
+    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
+    const manifest = AiManifestSchema.parse(JSON.parse(uploads.get('ai.json')!.toString()));
+    expect(manifest.description).not.toBeNull();
+    expect(manifest.notes[0]).toMatch(/không đọc được/);
+  });
+
+  it('fails (retryable) when no keyframe can be downloaded', async () => {
+    const ollama = await createFakeOllama({ responses: [VALID_NOTE, VALID_DESCRIPTION] });
+    const workDir = join(TEST_BASE, 'work_no_frames');
+    mkdirSync(workDir, { recursive: true });
+    const ctx = buildFakeAiContext(workDir, ollama.url, kfDir, makePayload(4, 4, 1), new AbortController().signal);
+    ctx.download = async () => { throw new Error('sign failed'); };
+
+    await expect(handleScanAi(ctx)).rejects.toThrow(/none of the 4 keyframe/);
+    await ollama.close();
+    expect(ollama.callCount).toBe(0);
+  });
+
   it('yields before each Ollama call', async () => {
     // 4 frames, frames_per_note=2 → 2 note calls + 1 summary = 3 Ollama calls
     // Each Ollama call is preceded by yieldToInteractive

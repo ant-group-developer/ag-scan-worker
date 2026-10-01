@@ -291,9 +291,14 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
   // ---- Bước 1: Ghi chú từng nhóm keyframe ----
 
   const notes: string[] = [];
+  let failedGroups = 0;
+  let lastNotesError: string | null = null;
   const notesSystemPrompt = buildNotesSystemPrompt();
   const totalFrames = localPaths.filter((p) => p !== '').length;
   const totalGroups = Math.ceil(keyframes.length / frames_per_note);
+  if (keyframes.length > 0 && totalFrames === 0) {
+    throw new Error(`scan.ai: none of the ${keyframes.length} keyframe(s) could be downloaded`);
+  }
 
   for (let gi = 0; gi < totalGroups; gi++) {
     await ctx.yieldToInteractive();
@@ -328,7 +333,9 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
     try {
       note = await callOllama(ollamaUrl, model, messages, keep_alive, ctx.signal, { numPredict: 1024 });
     } catch (e) {
-      log.warn(`Notes call failed for group ${gi}`, { error: String(e) });
+      lastNotesError = String(e);
+      failedGroups++;
+      log.warn(`Notes call failed for group ${gi}`, { error: lastNotesError });
       note = `(nhóm ${gi + 1}: không đọc được)`;
     }
 
@@ -337,7 +344,24 @@ async function runScanAi(ctx: JobContext, ollamaUrl: string): Promise<JobResult>
     log.info(`Note group ${gi + 1}/${totalGroups}`, { length: note.length });
   }
 
-  log.info('Notes step done', { groups: notes.length, totalFrames });
+  log.info('Notes step done', { groups: notes.length, failedGroups, totalFrames });
+
+  // Không nhóm nào đọc được (Ollama chết, model chưa nạp, không tải được keyframe nào): tóm tắt
+  // lúc này chỉ bịa ra mô tả từ các dòng "không đọc được" → ghi lỗi vào ai.json và để farm thử lại.
+  if (failedGroups > 0 && failedGroups === notes.length) {
+    const error = `scan.ai: every notes call failed (${failedGroups} group(s)): ${lastNotesError ?? 'unknown'}`;
+    await ctx.uploadJson(AI_MANIFEST_PATH, AiManifestSchema.parse({
+      schema: AI_MANIFEST_SCHEMA,
+      asset_id,
+      model,
+      prompt_version,
+      description: null,
+      notes,
+      error: error.slice(0, 2000),
+      duration_ms: Date.now() - t0,
+    } satisfies AiManifest));
+    throw new Error(error);
+  }
 
   // ---- Bước 2: Tóm tắt toàn video ----
 
