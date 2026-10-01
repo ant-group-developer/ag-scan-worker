@@ -13,7 +13,7 @@ function getConfigPath(): string {
   const args = process.argv.slice(2);
   const idx = args.indexOf('--config');
   if (idx === -1 || idx + 1 >= args.length) {
-    console.error('Dùng: ag-scan-worker --config <đường dẫn file YAML>');
+    console.error('Dung: ag-scan-worker --config <duong dan file YAML>');
     process.exit(1);
   }
   return args[idx + 1]!;
@@ -30,14 +30,14 @@ async function main(): Promise<void> {
   const pkg = require('../package.json') as { version?: string };
   const version = pkg.version ?? '0.0.0';
 
-  console.log(`ag-scan-worker v${version} khởi động với config: ${configPath}`);
+  console.log(`ag-scan-worker v${version} khoi dong voi config: ${configPath}`);
 
   // Quét là việc nền: chạy dưới mức ưu tiên thường để render trên cùng máy không bị giành CPU.
   // ffmpeg con thừa hưởng mức này (Windows: BELOW_NORMAL_PRIORITY_CLASS).
   try {
     setPriority(osConstants.priority.PRIORITY_BELOW_NORMAL);
   } catch (err) {
-    console.warn('Không hạ được mức ưu tiên tiến trình:', err);
+    console.warn('Khong ha duoc muc uu tien tien trinh:', err);
   }
 
   const extra = config.extra ?? {};

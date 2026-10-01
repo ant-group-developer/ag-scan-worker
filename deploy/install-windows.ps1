@@ -11,34 +11,34 @@ Set-Location $root
 
 # 1. Node 22+
 $nodeVersion = (& node --version) 2>$null
-if (-not $nodeVersion) { throw "Chưa cài Node.js 22+ (https://nodejs.org)" }
-if ([int]($nodeVersion.TrimStart('v').Split('.')[0]) -lt 22) { throw "Cần Node.js 22+, đang có $nodeVersion" }
+if (-not $nodeVersion) { throw "Chua cai Node.js 22+ (https://nodejs.org)" }
+if ([int]($nodeVersion.TrimStart('v').Split('.')[0]) -lt 22) { throw "Can Node.js 22+, dang co $nodeVersion" }
 $nodeExe = (Get-Command node).Source
 
 # 2. ffmpeg-static, ffprobe-static
 & npm install --omit=dev --no-audit --no-fund
-if ($LASTEXITCODE -ne 0) { throw "npm install lỗi" }
+if ($LASTEXITCODE -ne 0) { throw "npm install loi" }
 
 # 3. machine.yaml dùng chung cho mọi worker trên máy
 $machineDir = "C:\ProgramData\ag-farm"
 if (-not (Test-Path "$machineDir\machine.yaml")) {
   New-Item -ItemType Directory -Force $machineDir | Out-Null
   Copy-Item "deploy\machine.example.yaml" "$machineDir\machine.yaml"
-  Write-Host "Đã tạo $machineDir\machine.yaml: sửa số slot CPU/GPU cho đúng máy."
+  Write-Host "Da tao $machineDir\machine.yaml: sua so slot CPU/GPU cho dung may."
 }
 
 # 4. config.yaml
 if (-not (Test-Path "config.yaml")) {
   Copy-Item "deploy\config.example.yaml" "config.yaml"
-  Write-Host "Đã tạo config.yaml từ mẫu. Sửa hub_url, token, thư mục rồi chạy lại script này." -ForegroundColor Yellow
+  Write-Host "Da tao config.yaml tu mau. Sua hub_url, token, thu muc roi chay lai script nay." -ForegroundColor Yellow
   exit 1
 }
 
 # 5. Ollama
-try { Invoke-RestMethod http://localhost:11434/api/tags -TimeoutSec 5 | Out-Null } catch { Write-Warning "Không gọi được Ollama ở http://localhost:11434: job scan.ai sẽ lỗi" }
+try { Invoke-RestMethod http://localhost:11434/api/tags -TimeoutSec 5 | Out-Null } catch { Write-Warning "Khong goi duoc Ollama o http://localhost:11434: job scan.ai se loi" }
 
 # 6. Dịch vụ
-if (-not (Get-Command $Nssm -ErrorAction SilentlyContinue)) { throw "Không thấy NSSM ($Nssm). Cài từ https://nssm.cc rồi truyền -Nssm <đường dẫn nssm.exe>" }
+if (-not (Get-Command $Nssm -ErrorAction SilentlyContinue)) { throw "Khong thay NSSM ($Nssm). Cai tu https://nssm.cc roi truyen -Nssm <duong dan nssm.exe>" }
 New-Item -ItemType Directory -Force "logs" | Out-Null
 & $Nssm stop $ServiceName 2>$null | Out-Null
 & $Nssm remove $ServiceName confirm 2>$null | Out-Null
@@ -52,4 +52,4 @@ New-Item -ItemType Directory -Force "logs" | Out-Null
 & $Nssm set $ServiceName AppStopMethodConsole 120000
 & $Nssm set $ServiceName Start SERVICE_AUTO_START
 & $Nssm start $ServiceName
-Write-Host "Đã cài và khởi động dịch vụ $ServiceName. Log: $root\logs" -ForegroundColor Green
+Write-Host "Da cai va khoi dong dich vu $ServiceName. Log: $root\logs" -ForegroundColor Green
