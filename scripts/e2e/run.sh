@@ -55,7 +55,7 @@ export AUTH0_ISSUER_URL=https://x.auth0.com/ AUTH0_AUDIENCE=aud AUTH0_JWKS_URL=h
 export AUTH0_ALLOWED_CLIENT_IDS=c ACCOUNT_API_URL=http://127.0.0.1:1 PORT=3978 REAPER_INTERVAL_MS=5000
 cd "$FARM/apps/api" && node ../../node_modules/typeorm/cli.js migration:run -d dist/database/data-source.js >/dev/null || exit 1
 docker exec ag-farm-postgres-test-1 psql -U farm_test -d ag_farm_e2e -c \
-  "INSERT INTO farm_owners (id, key_hash, sign_url, allowed_types, default_lane) VALUES ('ag-go', '$OWNER_HASH', 'http://127.0.0.1:3979/sign', '{scan.extract,scan.ai}', 'batch');" \
+  "INSERT INTO farm_owners (id, key_hash, sign_url, allowed_types) VALUES ('ag-go', '$OWNER_HASH', 'http://127.0.0.1:3979/sign', '{scan.extract,scan.ai}');" \
   -c "INSERT INTO farm_nodes (name, machine, kinds, token_hash, status) VALUES ('e2e-worker', 'e2e-machine', '{scan.extract}', '$NODE_HASH', 'active');" >/dev/null || exit 1
 
 node dist/main.js > "$SP/hub.log" 2>&1 & pids+=($!)
