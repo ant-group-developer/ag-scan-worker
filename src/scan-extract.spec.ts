@@ -291,6 +291,49 @@ describe('handleScanExtract v2', () => {
     }
   });
 
+  it('skips the proxy when the source is no larger than it (a clean 720p preview)', async () => {
+    const workDir = join(TEST_BASE, 'work_extract_small_source');
+    mkdirSync(workDir, { recursive: true });
+
+    const payload = {
+      asset: {
+        id: '123e4567-e89b-42d3-a456-426614174005',
+        kind: 'video',
+        mime_type: 'video/mp4',
+        size_bytes: null,
+        checksum_sha256: null,
+        duration_ms: 12_000,
+        width: 3840,
+        height: 2160,
+      },
+      params: {
+        scene_threshold: 0.3,
+        min_scene_s: 1,
+        max_keyframes: 24,
+        keyframe_dedup_distance: 8,
+        keyframe_px: 160,
+        // Proxy bật nhưng nguồn 320×240 đã nhỏ hơn 720p
+        proxy: { enabled: true, height: 720, crf: 26, gop_s: 1 },
+        contact_sheet: { enabled: false, columns: 6, tile_px: 160 },
+        dead: { black_ratio_min: 0.9, frozen_ratio_min: 0.95, blur_min: 12 },
+        speech_silence_ratio_max: 0.6,
+      },
+      extract_version: 'test-v2',
+    };
+
+    const ac = new AbortController();
+    const ctx = buildFakeContext(workDir, signServer.url, s3.url, videoPath, payload, ac.signal);
+    await handleScanExtract(ctx);
+
+    const uploads = (ctx as unknown as { _uploads: Map<string, Buffer> })._uploads;
+    expect(uploads.has('proxy.mp4')).toBe(false);
+    const manifest = ExtractManifestSchema.parse(JSON.parse(uploads.get('extract.json')!.toString()));
+    expect(manifest.proxy).toBeNull();
+    // Kích thước là của file đã quét; chủ sở hữu tự đổi về khung file gốc
+    expect(manifest.media).toMatchObject({ width: 320, height: 240 });
+    expect(manifest.keyframes.length).toBeGreaterThanOrEqual(1);
+  });
+
   it('dedup reduces to 1 keyframe on a solid-color (fully-static) clip with max dedup distance', async () => {
     // Use a solid blue video. It has no scene cuts → 1 scene → 1 candidate keyframe.
     // With dedup_distance=64 (max possible), any two keyframes are considered duplicates,

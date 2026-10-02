@@ -281,10 +281,11 @@ ag-scan-worker
 ```
 
 **Luồng scan.extract** (v2):
-1. Tải file gốc (cache nếu có cache_key)
+1. Tải file nguồn `source` (cache nếu có cache_key): file gốc, hoặc bản preview sạch 720p–1080p
+   chủ sở hữu đưa thay khi có (cùng timeline và audio, nhỏ hơn nhiều)
 2. ffprobe → media info
-3. ffmpeg proxy 720p (H.264 CRF, NVDEC nếu có)
-4. Dò cảnh trên proxy → danh sách scenes (gộp cảnh ngắn hơn `min_scene_s`)
+3. ffmpeg proxy 720p (H.264 CRF, NVDEC nếu có); bỏ qua khi cạnh ngắn của nguồn ≤ `proxy.height`
+4. Dò cảnh trên proxy (hoặc thẳng trên nguồn khi không có proxy) → danh sách scenes (gộp cảnh ngắn hơn `min_scene_s`)
 5. Trích một keyframe đại diện mỗi cảnh (giữa cảnh); cạnh dài = `keyframe_px`; bỏ trùng dHash
 6. Chỉ số kỹ thuật cả video (một lần): brightness, blur, black, freeze, silence
 7. Contact sheet (tiles giữ tỉ lệ, không cắt)

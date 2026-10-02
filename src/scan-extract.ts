@@ -1,7 +1,10 @@
 /**
- * Handler scan.extract v2: tải file gốc → ffprobe → proxy 720p → dò cảnh →
+ * Handler scan.extract v2: tải file nguồn → ffprobe → proxy 720p → dò cảnh →
  * keyframe đại diện mỗi cảnh (cạnh dài keyframe_px, bỏ trùng dHash) →
  * chỉ số kỹ thuật cả video → contact sheet → upload manifest.
+ *
+ * File nguồn là file gốc, hoặc bản preview sạch (không watermark, 720p–1080p) chủ sở hữu đưa thay
+ * khi có: cùng timeline và audio, chỉ nhỏ hơn. Nguồn đã không lớn hơn proxy thì bỏ bước proxy.
  *
  * Không còn chia đoạn (segment): cảnh chỉ để chọn keyframe đại diện;
  * mô tả và chỉ số kỹ thuật tính cho cả file.
@@ -349,12 +352,19 @@ export async function handleScanExtract(ctx: JobContext): Promise<JobResult> {
     );
   }
 
-  // Proxy 720p
+  // Proxy 720p. Nguồn đã không lớn hơn proxy (bản preview 720p, file gốc nhỏ) thì encode lại không
+  // nhỏ đi mà chỉ tốn thời gian: phân tích thẳng trên file tải về.
   ctx.progress(16, 'proxy');
   let proxyInfo: ExtractManifest['proxy'] = null;
   const proxyPath = join(workDir, 'proxy.mp4');
+  const sourceIsSmall = Math.min(width, height) <= params.proxy.height;
+  if (params.proxy.enabled && sourceIsSmall) {
+    log.info('Source is no larger than the proxy, skipping proxy', {
+      width, height, proxy_height: params.proxy.height,
+    });
+  }
 
-  if (params.proxy.enabled) {
+  if (params.proxy.enabled && !sourceIsSmall) {
     const nvdec = await isNvdecAvailable();
     await makeProxy(sourceLocalPath, proxyPath, {
       height: params.proxy.height,
