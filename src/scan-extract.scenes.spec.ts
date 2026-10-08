@@ -169,7 +169,21 @@ describe('scan.extract v2 on real footage', () => {
       expect(kf.dhash).toMatch(/^[0-9a-f]{16}$/);
     });
 
-    expect(manifest.proxy).not.toBeNull();
+    // Nguồn 240p không lớn hơn proxy 720p: phân tích thẳng, không encode proxy
+    expect(manifest.proxy).toBeNull();
+  });
+
+  it('encodes a 720p proxy when the source is larger than it', async () => {
+    const path = join(BASE, 'larger-than-proxy.mp4');
+    await ffmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=size=1440x1080:rate=25:duration=2',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', path,
+    ]);
+
+    const manifest = await runExtract(path, { kind: 'video', mime_type: 'video/mp4' });
+
+    expect(manifest.proxy).toMatchObject({ output: 'proxy.mp4', width: 960, height: 720 });
+    expect(manifest.media).toMatchObject({ width: 1440, height: 1080 });
   });
 
   it('static clip (5s solid color): 1 scene, 1 keyframe, high frozen_ratio', async () => {
