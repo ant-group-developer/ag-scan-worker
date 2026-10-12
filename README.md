@@ -37,6 +37,19 @@ Từ 0.4.0, máy tự lên bản mới khi farm phát hành: mỗi 15 phút work
 
 Máy đang chạy 0.3.5 trở về trước chưa có bộ cập nhật: chạy lệnh cập nhật ở trên (bỏ `-Code`) **một lần cuối** bằng tay.
 
+### Phát hành bản mới (máy build Windows)
+
+Tăng `version` trong `package.json` (hub từ chối bản không mới hơn bản đang phát hành), rồi:
+
+```powershell
+$env:FARM_RELEASE_KEY = '<FARM_RELEASE_KEY của hub>'   # chỉ trong phiên này, không ghi vào file
+node scripts/release.mjs --publish --upload https://api-farm.ant-group.net
+```
+
+Script đóng gói rồi đẩy zip lên hub (`POST /v1/admin/releases`); hub kiểm sha256, lưu gói và `latest.json`, các máy tự
+cập nhật trong khoảng 15 phút. Hub khác dùng biến khác: `--key-env FARM_DEV_RELEASE_KEY`. Không còn chép tay lên VPS
+bằng scp; `--publish <thư mục>` vẫn chép vào một thư mục latest.json nếu cần.
+
 ### Loại job máy nhận
 
 Không khai `kinds`: worker báo mọi loại job nó có handler **và** máy đủ điều kiện theo `JOB_TYPE_SPECS` (`scan.ai` cần

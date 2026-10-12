@@ -9,6 +9,10 @@
  *   release/ag-scan-worker-<version>.zip
  *
  * Chạy trên máy dev đã build được repo (ag-farm nằm cạnh): node scripts/release.mjs
+ * Phát hành lên farm (máy worker tự cập nhật): khoá phát hành của hub trong biến môi trường FARM_RELEASE_KEY (không
+ * truyền khoá trên dòng lệnh), rồi
+ *   node scripts/release.mjs --publish --upload https://api-farm.ant-group.net [--key-env TÊN_BIẾN]
+ * Hub từ chối bản không mới hơn bản đang phát hành: tăng `version` trong package.json trước.
  */
 import { build } from 'esbuild';
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -58,15 +62,15 @@ writeFileSync(
 
 cpSync(join(root, 'deploy'), join(out, 'deploy'), { recursive: true });
 
-// node_modules, runtime/node.exe, run.cmd, zip và (với --publish <dir>) phát hành lên farm: phần chung
-// với worker kia, nằm ở ag-farm/tools/worker-installer.
+// node_modules, runtime/node.exe, run.cmd, zip và phát hành lên farm (--publish --upload <hub>, hoặc --publish <dir>):
+// phần chung với worker kia, nằm ở ag-farm/tools/worker-installer.
 const installer = join(root, '..', 'ag-farm', 'tools', 'worker-installer', 'package-release.mjs');
-const { finishRelease, publishDirFromArgv } = await import(pathToFileURL(installer).href);
-finishRelease({
+const { finishRelease, publishOptionsFromArgv } = await import(pathToFileURL(installer).href);
+await finishRelease({
   repoRoot: root,
   releaseRoot: join(root, 'release'),
   name,
-  packageName: 'ag-scan-worker',
+  packageName: 'ag-scan-worker', // = RELEASE_PACKAGE (src/release-package.ts): tên worker tự cập nhật theo
   version: pkg.version,
-  publishDir: publishDirFromArgv(),
+  ...publishOptionsFromArgv(),
 });
