@@ -6,6 +6,7 @@ import { constants as osConstants, setPriority } from 'node:os';
 import { runWorker, loadConfig } from '@ag-farm/worker-sdk';
 import { handleScanExtract } from './scan-extract';
 import { createScanAiHandler } from './scan-ai';
+import { scanCapabilitiesOptions } from './capabilities-options';
 
 // ---- Parse args ----
 
@@ -46,6 +47,8 @@ async function main(): Promise<void> {
   await runWorker({
     config,
     version,
+    // Không khai `kinds`: SDK báo mọi loại có handler mà máy chạy được (scan.ai cần GPU).
+    capabilitiesOptions: scanCapabilitiesOptions(extra),
     handlers: {
       'scan.extract': handleScanExtract,
       'scan.ai': createScanAiHandler({ ollamaUrl }),

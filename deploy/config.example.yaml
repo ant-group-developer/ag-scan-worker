@@ -1,4 +1,5 @@
-# Cấu hình ag-scan-worker. Sao chép thành config.yaml (cạnh package.json) rồi sửa.
+# Cấu hình ag-scan-worker cài tay (máy dev, Linux). Máy Windows cài bằng install.ps1 của farm: installer tự viết file
+# này và mỗi lần cập nhật viết lại khoá nó quản lý (extra.ollama_url), giữ các khoá khác.
 # Đường dẫn Windows viết trong nháy đơn để khỏi phải escape dấu \.
 
 # URL của ag-farm hub (API, không phải web quản lý)
@@ -7,10 +8,10 @@ hub_url: https://farm-api.example.com
 token: 'DAN_TOKEN_NODE_VAO_DAY'
 # Tên hiển thị trên trang Máy
 name: gpu-01-scan
-# Máy không có GPU: chỉ để scan.extract
-kinds:
-  - scan.extract
-  - scan.ai
+# Không khai kinds: worker nhận mọi loại job máy chạy được (máy không có GPU chỉ nhận scan.extract).
+# Khai thì là danh sách ép:
+# kinds:
+#   - scan.extract
 work_dir: 'D:\ag-farm\scan\work'
 # Cache file gốc tải về (không watermark): thư mục chỉ tài khoản chạy dịch vụ đọc được
 cache:
