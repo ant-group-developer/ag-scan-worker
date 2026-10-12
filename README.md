@@ -26,6 +26,17 @@ Sau mỗi lần cài/cập nhật, `C:\ag-farm\scan\config.yaml` được ghi l�
 `schedule` và mọi khoá anh tự thêm (kể cả trong `extra`); viết lại khoá installer quản lý (`extra.ollama_url`); bỏ danh
 sách `kinds`. Bản trước lưu ở `config.yaml.bak`.
 
+### Tự cập nhật
+
+Từ 0.4.0, máy tự lên bản mới khi farm phát hành: mỗi 15 phút worker xem `/dist/latest.json` của hub, có bản mới hơn
+(và trang **Máy** đang bật "Tự cập nhật" cho máy này, hoặc admin bấm "Cập nhật ngay") thì ngừng nhận việc, chờ việc
+đang chạy xong (tối đa 30 phút), rồi chạy task `ag-farm-updater`. Task cài bản mới như lệnh cập nhật (giữ bản cũ ở
+`C:\ag-farm\scan\app.prev`); bản mới không kết nối hub trong 3 phút thì quay về bản cũ. Kết quả và lỗi hiện ở trang
+**Máy**; log ở `C:\ag-farm\updater\updater.log`. Đổi chu kỳ/thời gian chờ: `update_check_minutes`,
+`update_drain_minutes` trong `config.yaml` (installer giữ giá trị anh đặt).
+
+Máy đang chạy 0.3.5 trở về trước chưa có bộ cập nhật: chạy lệnh cập nhật ở trên (bỏ `-Code`) **một lần cuối** bằng tay.
+
 ### Loại job máy nhận
 
 Không khai `kinds`: worker báo mọi loại job nó có handler **và** máy đủ điều kiện theo `JOB_TYPE_SPECS` (`scan.ai` cần
