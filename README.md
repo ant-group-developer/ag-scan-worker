@@ -37,6 +37,13 @@ Từ 0.4.0, máy tự lên bản mới khi farm phát hành: mỗi 15 phút work
 
 Máy đang chạy 0.3.5 trở về trước chưa có bộ cập nhật: chạy lệnh cập nhật ở trên (bỏ `-Code`) **một lần cuối** bằng tay.
 
+### Tình trạng máy
+
+Từ 0.4.0, worker đo máy mỗi 15 giây (CPU, RAM, ổ chứa `work_dir`/cache, mạng vào/ra, GPU qua `nvidia-smi`) và gửi kèm
+heartbeat; trang **Máy** của farm hiện các số này và biểu đồ 1 giờ / 24 giờ / 7 ngày. Không cần cài thêm gì; tắt bằng
+`metrics: false` trong `config.yaml`. Hub farm phải lên bản có số đo trước (hub cũ từ chối thì worker tự thôi gửi số đo
+trong một giờ, vẫn nhận việc bình thường).
+
 ### Phát hành bản mới (máy build Windows)
 
 Tăng `version` trong `package.json` (hub từ chối bản không mới hơn bản đang phát hành), rồi:
