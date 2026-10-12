@@ -8,64 +8,71 @@ Xử lý hai loại job: **scan.extract** (proxy + phát hiện cảnh + keyfram
 
 ---
 
-## Yêu cầu hệ thống
+## Cài trên máy worker (Windows)
+
+Không cài tay. Trang **Máy** của web farm → **Thêm máy** cho một lệnh; dán vào PowerShell mở bằng
+"Run as Administrator":
+
+```powershell
+iwr https://<farm>/dist/install.ps1 -UseBasicParsing | iex; Install-AgWorker -Hub https://<farm> -Code <mã>
+```
+
+Cập nhật lên bản mới: cùng lệnh, bỏ `-Code`. Installer tải gói (có sẵn Node, ffmpeg, sharp), tính slot
+(`C:\ProgramData\ag-farm\machine.yaml`), cài Ollama thành task hệ thống `ag-farm-ollama` và kéo model hub cấu hình
+(`FARM_OLLAMA_MODELS`, hoặc `-Model`), rồi chạy worker bằng task `ag-farm-scan` (tài khoản SYSTEM, tự chạy khi bật máy,
+chết thì chạy lại). Log: `C:\ag-farm\scan\logs\worker.log`.
+
+Sau mỗi lần cài/cập nhật, `C:\ag-farm\scan\config.yaml` được ghi lại: giữ `name`, `token`, `hub_url`, `cache`,
+`schedule` và mọi khoá anh tự thêm (kể cả trong `extra`); viết lại khoá installer quản lý (`extra.ollama_url`); bỏ danh
+sách `kinds`. Bản trước lưu ở `config.yaml.bak`.
+
+### Loại job máy nhận
+
+Không khai `kinds`: worker báo mọi loại job nó có handler **và** máy đủ điều kiện theo `JOB_TYPE_SPECS` (`scan.ai` cần
+GPU), dò lúc worker khởi động. Không muốn máy nhận một loại: tắt công tắc của loại đó ở trang **Máy**. `kinds` trong
+config vẫn dùng được để ép danh sách (giao với handler).
+
+Cách cài cũ bằng NSSM/WinSW (dịch vụ `ag-scan-worker`, Ollama chạy bằng NSSM) không dùng nữa; installer tự gỡ dịch vụ
+NSSM cũ.
+
+---
+
+## Phát triển (máy dev)
 
 | Thành phần | Phiên bản tối thiểu |
 |---|---|
 | Node.js | 22+ |
-| ffmpeg | 6.0+ (có `libx264`, tùy chọn `h264_nvenc`, `cuda`) |
+| ffmpeg | lấy từ `ffmpeg-static` (hoặc `FFMPEG_PATH`); có `h264_nvenc`, `cuda` thì dùng |
 | Ollama | 0.3+ (cho scan.ai) |
 | RAM | 8 GB+ |
-| GPU | NVIDIA (tùy chọn, tăng tốc encode/decode) |
-
----
-
-## Cài đặt
+| GPU | NVIDIA (scan.ai; tăng tốc encode/decode) |
 
 ```bash
-# Clone repo
 git clone ... ag-scan-worker
 cd ag-scan-worker
-
-# Cài dependencies
 yarn install
-
-# Build TypeScript
 yarn build
 ```
-
----
-
-## Cấu hình
 
 ### config.yaml
 
 ```yaml
 hub_url: https://farm.example.com
 token: your-node-token-here          # hoặc dùng token_file
+name: scan-dev
+# kinds: [scan.extract]              # tuỳ chọn: ép danh sách; bỏ trống = mọi loại máy chạy được
 
-name: scan-worker-001
-kinds:
-  - scan.extract
-  - scan.ai
-
-work_dir: C:\ag-farm\work            # Windows
-# work_dir: /var/ag-farm/work        # Linux
-
+work_dir: 'C:\ag-dev\scan\work'
 cache:
-  dir: C:\ag-farm\cache
+  dir: 'C:\ag-dev\scan\cache'
   max_gb: 50
-
-machine_file: C:\ProgramData\ag-farm\machine.yaml
+machine_file: 'C:\ProgramData\ag-farm\machine.yaml'
 
 # Lịch chạy tuần (tuỳ chọn; vắng mặt = 24/7)
 schedule:
   - days: [1, 2, 3, 4, 5]           # Thứ 2–6
     from: "19:00"
     to:   "07:00"                    # Qua đêm
-  - days: [0, 6]                    # Cuối tuần
-    from: "00:00"
-    to:   "23:59"
 
 extra:
   ollama_url: http://localhost:11434
@@ -86,66 +93,13 @@ reserve_interactive:
 **`gpu_slots`**: số job GPU (scan.extract có proxy, scan.ai).  
 **`reserve_interactive`**: số slot giữ lại cho lane `interactive` (Studio đang chờ).
 
----
-
-## Chạy thủ công
-
 ```bash
-# Chạy từ source (phát triển)
-npx ts-node src/main.ts --config config.yaml
-
-# Chạy từ bản build
 node dist/main.js --config config.yaml
 ```
 
----
+### Linux (systemd, cài tay)
 
-## Cài dịch vụ Windows (NSSM)
-
-[NSSM](https://nssm.cc) quản lý process như Windows Service:
-
-```powershell
-# Cài NSSM (Chocolatey)
-choco install nssm -y
-
-# Tạo service
-nssm install ag-scan-worker "C:\Program Files\nodejs\node.exe"
-nssm set ag-scan-worker AppParameters "E:\ag-scan-worker\dist\main.js --config E:\ag-scan-worker\config.yaml"
-nssm set ag-scan-worker AppDirectory "E:\ag-scan-worker"
-nssm set ag-scan-worker DisplayName "AG Farm Scan Worker"
-nssm set ag-scan-worker Description "Worker quét footage ag-farm"
-nssm set ag-scan-worker Start SERVICE_AUTO_START
-
-# Khởi động
-nssm start ag-scan-worker
-
-# Xem log
-nssm status ag-scan-worker
-```
-
-Hoặc dùng **WinSW**:
-
-```xml
-<!-- ag-scan-worker.xml -->
-<service>
-  <id>ag-scan-worker</id>
-  <name>AG Farm Scan Worker</name>
-  <executable>node</executable>
-  <arguments>dist\main.js --config config.yaml</arguments>
-  <workingdirectory>E:\ag-scan-worker</workingdirectory>
-  <logmode>rotate</logmode>
-  <onfailure action="restart" delay="10 sec"/>
-</service>
-```
-
-```powershell
-WinSW.exe install ag-scan-worker.xml
-WinSW.exe start ag-scan-worker
-```
-
----
-
-## Cài dịch vụ Linux (systemd)
+Installer chỉ có cho Windows.
 
 ```ini
 # /etc/systemd/system/ag-scan-worker.service
@@ -165,55 +119,6 @@ Environment=NODE_ENV=production
 
 [Install]
 WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable ag-scan-worker
-sudo systemctl start ag-scan-worker
-journalctl -u ag-scan-worker -f
-```
-
----
-
-## Ollama (Windows Service)
-
-Chạy Ollama như Windows Service để scan.ai hoạt động khi không đăng nhập:
-
-```powershell
-# Cài Ollama
-winget install Ollama.Ollama
-
-# Cài service dùng NSSM
-nssm install ollama "C:\Users\<user>\AppData\Local\Programs\Ollama\ollama.exe"
-nssm set ollama AppParameters "serve"
-nssm set ollama AppEnvironmentExtra "OLLAMA_MODELS=C:\ag-farm\ollama-models"
-nssm set ollama Start SERVICE_AUTO_START
-nssm start ollama
-
-# Pull model
-ollama pull qwen2.5vl:7b
-```
-
-> **OLLAMA_MODELS**: chỉ định thư mục lưu models để tránh đầy ổ C.
-
----
-
-## Cache – quyền truy cập
-
-Thư mục cache (`cache.dir`) cần được tạo sẵn với quyền đọc/ghi cho user chạy service:
-
-```powershell
-# Windows
-New-Item -ItemType Directory -Force "C:\ag-farm\cache"
-icacls "C:\ag-farm\cache" /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)F"
-```
-
-```bash
-# Linux
-sudo mkdir -p /var/ag-farm/cache
-sudo chown ag-farm:ag-farm /var/ag-farm/cache
-sudo chmod 755 /var/ag-farm/cache
 ```
 
 ---
