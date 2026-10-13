@@ -6,6 +6,8 @@ import { constants as osConstants, setPriority } from 'node:os';
 import { runWorker, loadConfig } from '@ag-farm/worker-sdk';
 import { handleScanExtract } from './scan-extract';
 import { createScanAiHandler } from './scan-ai';
+import { scanCapabilitiesOptions } from './capabilities-options';
+import { RELEASE_PACKAGE } from './release-package';
 
 // ---- Parse args ----
 
@@ -46,6 +48,10 @@ async function main(): Promise<void> {
   await runWorker({
     config,
     version,
+    // Không khai `kinds`: SDK báo mọi loại có handler mà máy chạy được (scan.ai cần GPU).
+    capabilitiesOptions: scanCapabilitiesOptions(extra),
+    // Máy cài bằng install.ps1 (config có updater_task): tự lên bản mới khi hub phát hành.
+    selfUpdate: { package: RELEASE_PACKAGE },
     handlers: {
       'scan.extract': handleScanExtract,
       'scan.ai': createScanAiHandler({ ollamaUrl }),
