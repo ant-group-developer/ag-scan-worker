@@ -1,7 +1,8 @@
 # ag-scan-worker
 
 Worker quét footage cho máy cấu hình cao trong hệ thống [ag-farm](https://github.com/your-org/ag-farm).  
-Xử lý hai loại job: **scan.extract** (proxy + phát hiện cảnh + keyframe cả video) và **scan.ai** (Ollama Qwen-VL mô tả cả video).
+Xử lý ba loại job: **scan.extract** (proxy + phát hiện cảnh + keyframe cả video), **scan.ai** (Ollama Qwen-VL mô tả cả video)
+và **scan.prep** (cảnh, khung, tờ cảnh, `audio.wav` cho Studio, theo đúng luật cắt cảnh của Studio).
 
 > **v2**: scan.extract không còn chia đoạn footage — nó mô tả cả file. Cảnh chỉ dùng để chọn keyframe đại diện.
 > scan.ai làm việc theo hai bước: ghi chú từng nhóm keyframe rồi viết một `AssetDescription` cho cả video.
@@ -207,6 +208,8 @@ ag-scan-worker
 │   ├── main.ts            # CLI entry point
 │   ├── scan-extract.ts    # Handler scan.extract
 │   ├── scan-ai.ts         # Handler scan.ai
+│   ├── scan-prep.ts       # Handler scan.prep
+│   ├── shots.ts           # Thuần: buildShots của Studio, đọc mốc cắt
 │   ├── segmentation.ts    # Thuần: chia đoạn + gộp dHash
 │   ├── ffmpeg-utils.ts    # Wrappers ffmpeg/ffprobe
 │   ├── dhash.ts           # dHash 64-bit qua sharp
@@ -226,6 +229,16 @@ ag-scan-worker
 6. Chỉ số kỹ thuật cả video (một lần): brightness, blur, black, freeze, silence
 7. Contact sheet (tiles giữ tỉ lệ, không cắt)
 8. Upload tất cả → upload `extract.json` (schema `ag.scan.extract/v2`)
+
+**Luồng scan.prep** (đầu vào Studio chuẩn bị sẵn ở ag-go; luật giống hệt ag-studio `workspace/prepare.ts`):
+1. Tải `source` (bản sạch nhỏ nhất ag-go có), ffprobe (thời lượng, cỡ, fps, có tiếng)
+2. Dò cảnh trọn video: `select='gt(scene\,0.3)',showinfo`, `-an`, mốc cắt làm tròn 0,1 s; không giới hạn 120 s, timeout
+   = max(10 phút, 2 × thời lượng)
+3. `buildShots` (chép từ ag-studio `packages/core/src/media/scene.ts`): gộp cảnh < `min_shot_s`, chia cảnh > `max_shot_s`
+4. Khung giữa mỗi cảnh (`round(((in+out)/2)*1000)/1000`, `scale=480:-2`), 4 ffmpeg một lúc → `frames/NNN.jpg`
+5. Tờ cảnh: 16 cảnh mỗi tờ theo thứ tự, ffmpeg `tile=4x<ceil(n/4)>` → `sheets/NN.jpg`
+6. `audio.wav` 16 kHz mono pcm_s16le khi có tiếng và `params.audio` (ag-go gửi tiếp `studio.transcribe`)
+7. Upload tất cả → upload `prep.json` (schema `ag.scan.prep/v1`)
 
 **Luồng scan.ai** (v2):
 1. Tải tất cả keyframe từ artifact

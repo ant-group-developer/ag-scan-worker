@@ -14,6 +14,10 @@ import {
   detectSceneChanges,
   extractKeyframe,
   getTechMetrics,
+  detectPrepCuts,
+  extractPrepAudio,
+  grabPrepFrame,
+  tilePrepSheet,
 } from './ffmpeg-utils';
 
 const execFileAsync = promisify(execFile);
@@ -104,6 +108,8 @@ describe('ffmpeg-utils integration', () => {
       expect(info.width).toBe(640);
       expect(info.height).toBe(480);
       expect(info.fps).toBeCloseTo(25, 0);
+      expect(info.avg_fps).toBe(25);
+      expect(info.duration_s).toBeCloseTo(15, 1);
     });
 
     it('detects still PNG', async () => {
@@ -235,6 +241,41 @@ describe('ffmpeg-utils integration', () => {
       const path = await createTestVideo('doubled_test.mp4', 'testsrc2=size=320x240:rate=25,fps=50', 5);
       const metrics = await getTechMetrics(path, 0, 5, false, noopLog);
       expect(metrics.frozen_ratio).toBeLessThan(0.1);
+    });
+  });
+
+  describe('scan.prep commands (same as Studio)', () => {
+    it('finds a cut past the first 120 s, on the 0.1 s grid, and reports progress', async () => {
+      const path = join(TEST_TMP, 'prep_long.mp4');
+      if (!existsSync(path)) {
+        await execFileAsync(ffmpeg, [
+          '-y', '-f', 'lavfi',
+          '-i', 'color=c=red:s=160x120:r=10:d=130[a];color=c=blue:s=160x120:r=10:d=20[b];[a][b]concat=n=2:v=1:a=0',
+          '-c:v', 'libx264', '-crf', '35', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+          path,
+        ], { timeout: 120_000 });
+      }
+      let decoded = 0;
+      const cuts = await detectPrepCuts(ffmpeg, path, 0.3, 0, { timeoutMs: 600_000, onTime: (t) => { decoded = Math.max(decoded, t); } });
+      expect(cuts).toEqual([130]);
+      // -progress đếm theo khung ra khỏi select (khung cắt cuối), như ở Studio
+      expect(decoded).toBeGreaterThanOrEqual(130);
+    });
+
+    it('tiles frames left to right, padding the last row, and finds no sound in a silent video', async () => {
+      const path = await createTestVideo('prep_tile.mp4', 'testsrc2=size=320x240:rate=25', 5);
+      const frames: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        const dest = join(TEST_TMP, 'prep_frames', `${i + 1}.jpg`);
+        await grabPrepFrame(ffmpeg, path, i + 0.5, dest, 160);
+        frames.push(dest);
+      }
+      const sheet = join(TEST_TMP, 'prep_sheets', '01.jpg');
+      await tilePrepSheet(ffmpeg, frames, 4, sheet);
+      const probe = await probeMedia(sheet, ffprobe);
+      expect([probe.width, probe.height]).toEqual([640, 240]);
+
+      expect(await extractPrepAudio(ffmpeg, path, join(TEST_TMP, 'prep_silent.wav'), { timeoutMs: 60_000 })).toBe(false);
     });
   });
 });

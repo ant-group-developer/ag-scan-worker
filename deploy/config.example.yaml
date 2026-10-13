@@ -8,7 +8,7 @@ hub_url: https://farm-api.example.com
 token: 'DAN_TOKEN_NODE_VAO_DAY'
 # Tên hiển thị trên trang Máy
 name: gpu-01-scan
-# Không khai kinds: worker nhận mọi loại job máy chạy được (máy không có GPU chỉ nhận scan.extract).
+# Không khai kinds: worker nhận mọi loại job máy chạy được (máy không có GPU chỉ nhận scan.extract, scan.prep).
 # Khai thì là danh sách ép:
 # kinds:
 #   - scan.extract
