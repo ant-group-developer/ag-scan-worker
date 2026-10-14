@@ -6,6 +6,7 @@ import { constants as osConstants, setPriority } from 'node:os';
 import { runWorker, loadConfig } from '@ag-farm/worker-sdk';
 import { handleScanExtract } from './scan-extract';
 import { createScanAiHandler } from './scan-ai';
+import { createScanPrepHandler } from './scan-prep';
 import { scanCapabilitiesOptions } from './capabilities-options';
 import { RELEASE_PACKAGE } from './release-package';
 
@@ -55,6 +56,7 @@ async function main(): Promise<void> {
     handlers: {
       'scan.extract': handleScanExtract,
       'scan.ai': createScanAiHandler({ ollamaUrl }),
+      'scan.prep': createScanPrepHandler({ workerVersion: version }),
     },
   });
 }

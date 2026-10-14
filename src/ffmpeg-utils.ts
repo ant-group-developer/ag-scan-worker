@@ -1,11 +1,14 @@
 /**
- * Tiện ích ffmpeg/ffprobe: resolve đường dẫn, chạy probe, dò cảnh, làm proxy, trích keyframe.
+ * Tiện ích ffmpeg/ffprobe: resolve đường dẫn, chạy probe, dò cảnh, làm proxy, trích keyframe; và các lệnh của
+ * scan.prep, giống hệt lệnh Studio dùng (ag-studio `packages/studio-engine/src/cut-ffmpeg.ts`).
  */
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { dirname, extname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { runProcess } from '@ag-farm/worker-sdk';
 import type { Logger } from '@ag-farm/worker-sdk';
+import { parseSceneCuts } from './shots';
 
 const execFileAsync = promisify(execFile);
 
@@ -48,6 +51,10 @@ export interface MediaInfo {
   has_audio: boolean;
   rotation: number;
   start_time_ms: number;
+  /** Thời lượng chưa làm tròn (giây), như Studio đưa vào `buildShots`. */
+  duration_s: number;
+  /** FPS theo `avg_frame_rate` trước (như Studio), làm tròn 3 chữ số; `null` khi không đọc được. */
+  avg_fps: number | null;
 }
 
 interface FfprobeStream {
@@ -106,6 +113,8 @@ export async function probeMedia(filePath: string, ffprobe: string): Promise<Med
     }
   }
 
+  const avgFps = frameRate(videoStream.avg_frame_rate) ?? frameRate(videoStream.r_frame_rate);
+
   // Rotation
   let rotation = 0;
   const rotateTag = videoStream.tags?.rotate;
@@ -149,7 +158,17 @@ export async function probeMedia(filePath: string, ffprobe: string): Promise<Med
     has_audio: audioStream !== undefined,
     rotation: Math.abs(rotation) % 360,
     start_time_ms: Math.round(startTimeSec * 1000),
+    duration_s: durationSec,
+    avg_fps: isImage ? null : avgFps,
   };
+}
+
+/** `30000/1001` → 29.97 (3 chữ số); `0/0`, rỗng → null. */
+function frameRate(v: string | undefined): number | null {
+  if (!v) return null;
+  const [n, d] = v.split('/').map(Number);
+  const r = d ? n! / d : n!;
+  return Number.isFinite(r) && r > 0 ? Math.round(r * 1000) / 1000 : null;
 }
 
 // ---- Scene detection ----
@@ -419,4 +438,134 @@ export function sumIntervals(stderr: string, key: 'black' | 'freeze' | 'silence'
   }
   if (open !== null) sum += Math.max(0, total - open);
   return Math.min(total, sum);
+}
+
+// ---- scan.prep: cùng lệnh ffmpeg với Studio ----
+
+/** Lỗi ffmpeg của scan.prep (không chạy được, thoát mã ≠ 0, quá giờ); handler để SDK thử lại. */
+function prepCheck(r: Awaited<ReturnType<typeof runProcess>>, stderr: string, what: string, timedOut: boolean): void {
+  if (timedOut) throw new Error(`${what}: timed out`);
+  if (r.exitCode !== 0) throw new Error(`${what}: exit ${String(r.exitCode)}: ${stderr.slice(-300)}`);
+}
+
+/** Chạy ffmpeg, giữ stderr; `timedOut` khi bị giết vì quá `timeoutMs` (không phải vì job bị huỷ). */
+async function runFfmpeg(
+  ffmpeg: string,
+  args: string[],
+  o: { timeoutMs: number; signal?: AbortSignal; onStdoutLine?: (line: string) => void },
+): Promise<{ result: Awaited<ReturnType<typeof runProcess>>; stderr: string; timedOut: boolean }> {
+  let stderr = '';
+  const started = Date.now();
+  const result = await runProcess(ffmpeg, args, {
+    timeoutMs: o.timeoutMs,
+    ...(o.signal ? { signal: o.signal } : {}),
+    ...(o.onStdoutLine ? { onStdoutLine: o.onStdoutLine } : {}),
+    onStderrLine: (line) => { stderr += line + '\n'; },
+  });
+  if (o.signal?.aborted) throw o.signal.reason ?? new Error('aborted');
+  const timedOut = result.signal !== null && Date.now() - started >= o.timeoutMs;
+  return { result, stderr, timedOut };
+}
+
+/**
+ * Dò cảnh cả video như Studio (`detectCuts`): `select='gt(scene\,T)',showinfo`, `-an`, mốc cắt theo lưới 0,1 s.
+ * Không cắt ngang ở 120 s như `detectSceneChanges`: Studio dò trọn video, nên ở đây cũng vậy (timeout do handler
+ * tính theo thời lượng). `onTime`: đã giải mã tới giây thứ mấy (từ `-progress`).
+ */
+export async function detectPrepCuts(
+  ffmpeg: string,
+  filePath: string,
+  threshold: number,
+  startTimeS: number,
+  o: { timeoutMs: number; signal?: AbortSignal; onTime?: (seconds: number) => void },
+): Promise<number[]> {
+  const vf = `select='gt(scene\\,${threshold})',showinfo`;
+  const progress = o.onTime ? ['-progress', 'pipe:1'] : [];
+  const { result, stderr, timedOut } = await runFfmpeg(
+    ffmpeg,
+    ['-hide_banner', '-nostats', ...progress, '-i', filePath, '-vf', vf, '-an', '-f', 'null', '-'],
+    {
+      timeoutMs: o.timeoutMs,
+      ...(o.signal ? { signal: o.signal } : {}),
+      ...(o.onTime ? { onStdoutLine: progressLine(o.onTime) } : {}),
+    },
+  );
+  prepCheck(result, stderr, `scene detection of ${filePath}`, timedOut);
+  return parseSceneCuts(stderr, startTimeS);
+}
+
+/** Một dòng `-progress` của ffmpeg (`out_time_us=…`) → giây. */
+function progressLine(onTime: (seconds: number) => void): (line: string) => void {
+  return (line) => {
+    const m = /^out_time_(?:us|ms)=(\d+)$/.exec(line.trim());
+    if (m) onTime(Number(m[1]) / 1_000_000);
+  };
+}
+
+/** Một khung tại `t` giây, rộng `width` px (cao giữ tỉ lệ, chẵn), JPEG — như `grabFrame` của Studio. */
+export async function grabPrepFrame(
+  ffmpeg: string,
+  src: string,
+  t: number,
+  dest: string,
+  width: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  mkdirSync(dirname(dest), { recursive: true });
+  const { result, stderr, timedOut } = await runFfmpeg(
+    ffmpeg,
+    ['-y', '-hide_banner', '-loglevel', 'error', '-ss', t.toFixed(3), '-i', src, '-frames:v', '1', '-vf', `scale=${width}:-2`, dest],
+    { timeoutMs: 60_000, ...(signal ? { signal } : {}) },
+  );
+  prepCheck(result, stderr, `frame at ${t}s of ${src}`, timedOut);
+  if (!existsSync(dest)) throw new Error(`frame at ${t}s of ${src}: ffmpeg wrote nothing`);
+}
+
+/**
+ * Các khung (cùng cỡ) xếp trái sang phải, trên xuống dưới, `cols` cột, thành một ảnh — như `tileSheet` của Studio:
+ * chép khung thành dãy số rồi đưa vào filter `tile=<cols>x<ceil(n/cols)>`, hàng cuối thiếu thì nền đen.
+ */
+export async function tilePrepSheet(
+  ffmpeg: string,
+  frames: string[],
+  cols: number,
+  dest: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (frames.length === 0) throw new Error('tilePrepSheet: no frames');
+  mkdirSync(dirname(dest), { recursive: true });
+  const seq = mkdtempSync(join(dirname(dest), '.sheet-'));
+  try {
+    frames.forEach((f, i) => copyFileSync(f, join(seq, `${String(i + 1).padStart(3, '0')}${extname(f)}`)));
+    const rows = Math.ceil(frames.length / cols);
+    const pattern = join(seq, `%03d${extname(frames[0]!)}`);
+    const { result, stderr, timedOut } = await runFfmpeg(
+      ffmpeg,
+      ['-y', '-hide_banner', '-loglevel', 'error', '-framerate', '1', '-i', pattern, '-vf', `tile=${cols}x${rows}`, '-frames:v', '1', dest],
+      { timeoutMs: 60_000, ...(signal ? { signal } : {}) },
+    );
+    prepCheck(result, stderr, `contact sheet ${dest}`, timedOut);
+  } finally {
+    rmSync(seq, { recursive: true, force: true });
+  }
+}
+
+/** Tiếng của `src` thành WAV PCM 16 kHz mono (WhisperX đọc), như `extractAudio16k` của Studio; `false` khi không có tiếng. */
+export async function extractPrepAudio(
+  ffmpeg: string,
+  src: string,
+  dest: string,
+  o: { timeoutMs: number; signal?: AbortSignal },
+): Promise<boolean> {
+  mkdirSync(dirname(dest), { recursive: true });
+  const { result, stderr, timedOut } = await runFfmpeg(
+    ffmpeg,
+    ['-y', '-hide_banner', '-nostats', '-i', src, '-vn', '-map', '0:a:0?', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', dest],
+    o,
+  );
+  if (result.exitCode !== 0 && !timedOut && /does not contain any stream|Output file .* does not contain|matches no streams/i.test(stderr)) {
+    return false;
+  }
+  prepCheck(result, stderr, `audio of ${src}`, timedOut);
+  return true;
 }
