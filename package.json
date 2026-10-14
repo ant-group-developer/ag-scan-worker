@@ -1,7 +1,7 @@
 {
   "name": "@ag-farm/ag-scan-worker",
-  "version": "0.4.0",
-  "description": "Worker quét footage (scan.extract, scan.ai) cho máy cấu hình cao",
+  "version": "0.5.0",
+  "description": "Worker quét footage (scan.extract, scan.ai, scan.prep) cho máy cấu hình cao",
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
